@@ -12,6 +12,13 @@ import platform
 import psutil
 import torch
 
+# 新增：导入NPU支持
+try:
+    import torch_npu
+    NPU_AVAILABLE = True
+except ImportError:
+    NPU_AVAILABLE = False
+
 def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
     try:
@@ -42,26 +49,27 @@ def get_git_info():
     return info
 
 def get_gpu_info():
-    """Get GPU information."""
-    if not torch.cuda.is_available():
+    """获取8卡NPU硬件信息"""
+    if not hasattr(torch, 'npu') or not torch.npu.is_available():
         return {"available": False}
 
-    num_devices = torch.cuda.device_count()
+    num_devices = torch.npu.device_count()  # 8
     info = {
         "available": True,
         "count": num_devices,
         "names": [],
-        "memory_gb": []
+        "memory_gb": [],
+        "total_memory_gb": 0.0
     }
 
     for i in range(num_devices):
-        props = torch.cuda.get_device_properties(i)
+        props = torch.npu.get_device_properties(i)
         info["names"].append(props.name)
-        info["memory_gb"].append(props.total_memory / (1024**3))
+        mem_gb = props.total_memory / (1024**3)
+        info["memory_gb"].append(mem_gb)
+        info["total_memory_gb"] += mem_gb
 
-    # Get CUDA version
-    info["cuda_version"] = torch.version.cuda or "unknown"
-
+    info["npu_version"] = torch_npu.__version__ if hasattr(torch_npu, '__version__') else "unknown"
     return info
 
 def get_system_info():
@@ -86,25 +94,27 @@ def get_system_info():
 
     return info
 
+# estimate_cost（适配 NPU 成本估算）
 def estimate_cost(gpu_info, runtime_hours=None):
-    """Estimate training cost based on GPU type and runtime."""
+    """Estimate training cost based on GPU/NPU type and runtime."""
 
-    # Rough pricing, from Lambda Cloud
+    # Rough pricing (适配NPU)
     default_rate = 2.0
-    gpu_hourly_rates = {
+    device_hourly_rates = {
         "H100": 3.00,
         "A100": 1.79,
         "V100": 0.55,
+        "Ascend": 1.50,  # 昇腾NPU hourly rate
     }
 
     if not gpu_info.get("available"):
         return None
 
-    # Try to identify GPU type from name
+    # Try to identify device type from name
     hourly_rate = None
-    gpu_name = gpu_info["names"][0] if gpu_info["names"] else "unknown"
-    for gpu_type, rate in gpu_hourly_rates.items():
-        if gpu_type in gpu_name:
+    device_name = gpu_info["names"][0] if gpu_info["names"] else "unknown"
+    for dev_type, rate in device_hourly_rates.items():
+        if dev_type in device_name:
             hourly_rate = rate * gpu_info["count"]
             break
 
@@ -113,20 +123,30 @@ def estimate_cost(gpu_info, runtime_hours=None):
 
     return {
         "hourly_rate": hourly_rate,
-        "gpu_type": gpu_name,
+        "device_type": device_name,
         "estimated_total": hourly_rate * runtime_hours if runtime_hours else None
     }
 
+
+# generate_header（优化，适配 NPU + 展示）
 def generate_header():
-    """Generate the header for a training report."""
+    """Generate the header for a training report (适配单卡/8卡NPU，完整最终版)."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 采集各类信息
     git_info = get_git_info()
-    gpu_info = get_gpu_info()
+    device_info = get_gpu_info()  # 兼容NPU/GPU
     sys_info = get_system_info()
-    cost_info = estimate_cost(gpu_info)
+    cost_info = estimate_cost(device_info)
 
-    header = f"""# nanochat training report
+    # 确定设备类型标题（单卡/8卡NPU/GPU）
+    device_title = "NPU" if "npu_version" in device_info else "GPU"
+    card_count = device_info.get("count", 0)
+    card_type = f"{card_count}卡" if card_count > 1 else "单卡"
+    report_title = f"nanochat training report ({card_type} {device_title})"
+
+    # 构建头部内容
+    header = f"""# {report_title}
 
 Generated: {timestamp}
 
@@ -135,65 +155,84 @@ Generated: {timestamp}
 ### Git Information
 - Branch: {git_info['branch']}
 - Commit: {git_info['commit']} {"(dirty)" if git_info['dirty'] else "(clean)"}
-- Message: {git_info['message']}
+- Commit Message: {git_info['message'] or "No message"}
 
 ### Hardware
 - Platform: {sys_info['platform']}
-- CPUs: {sys_info['cpu_count']} cores ({sys_info['cpu_count_logical']} logical)
-- Memory: {sys_info['memory_gb']:.1f} GB
+- Hostname: {sys_info['hostname']}
+- CPUs: {sys_info['cpu_count']} physical cores ({sys_info['cpu_count_logical']} logical)
+- System Memory: {sys_info['memory_gb']} GB
 """
 
-    if gpu_info.get("available"):
-        gpu_names = ", ".join(set(gpu_info["names"]))
-        total_vram = sum(gpu_info["memory_gb"])
-        header += f"""- GPUs: {gpu_info['count']}x {gpu_names}
-- GPU Memory: {total_vram:.1f} GB total
-- CUDA Version: {gpu_info['cuda_version']}
+    # 设备信息展示（区分NPU/GPU）
+    if device_info.get("available"):
+        dev_names = ", ".join(set(device_info["names"]))  # 去重设备名称
+        header += f"""- Accelerators: {device_info['count']}x {dev_names}
+- Total Accelerator Memory: {device_info['total_memory_gb']} GB
 """
+        # 显示NPU/CUDA版本
+        if "npu_version" in device_info:
+            header += f"- NPU Version: {device_info['npu_version']}\n"
+        if "cuda_version" in device_info:
+            header += f"- CUDA Version: {device_info['cuda_version']}\n"
     else:
-        header += "- GPUs: None available\n"
+        header += "- Accelerators: None available (CPU only)\n"
 
+    # 成本估算
     if cost_info and cost_info["hourly_rate"] > 0:
-        header += f"""- Hourly Rate: ${cost_info['hourly_rate']:.2f}/hour\n"""
+        header += f"""- Hourly Rate (estimated): ${cost_info['hourly_rate']}/hour\n"""
 
+    # 软件信息
     header += f"""
 ### Software
-- Python: {sys_info['python_version']}
-- PyTorch: {sys_info['torch_version']}
+- Python Version: {sys_info['python_version']}
+- PyTorch Version: {sys_info['torch_version']}
+- Working Directory: {sys_info['working_dir']}
+- Output Directory: {sys_info['nanochat_base_dir']}
 
+### Code & Dependencies (Bloat Metrics)
 """
 
-    # bloat metrics: count lines/chars in git-tracked source files only
+    # 代码统计（兼容非Git仓库）
     extensions = ['py', 'md', 'rs', 'html', 'toml', 'sh']
     git_patterns = ' '.join(f"'*.{ext}'" for ext in extensions)
     files_output = run_command(f"git ls-files -- {git_patterns}")
-    file_list = [f for f in (files_output or '').split('\n') if f]
+    file_list = [f for f in (files_output or '').split('\n') if f.strip()]
     num_files = len(file_list)
     num_lines = 0
     num_chars = 0
+
     if num_files > 0:
         wc_output = run_command(f"git ls-files -- {git_patterns} | xargs wc -lc 2>/dev/null")
         if wc_output:
             total_line = wc_output.strip().split('\n')[-1]
             parts = total_line.split()
             if len(parts) >= 2:
-                num_lines = int(parts[0])
-                num_chars = int(parts[1])
+                try:
+                    num_lines = int(parts[0])
+                    num_chars = int(parts[1])
+                except ValueError:
+                    num_lines = 0
+                    num_chars = 0
     num_tokens = num_chars // 4  # assume approximately 4 chars per token
 
-    # count dependencies via uv.lock
+    # 依赖统计（兼容uv.lock不存在）
     uv_lock_lines = 0
-    if os.path.exists('uv.lock'):
-        with open('uv.lock', 'r', encoding='utf-8') as f:
-            uv_lock_lines = len(f.readlines())
+    uv_lock_path = os.path.join(sys_info['working_dir'], 'uv.lock')
+    if os.path.exists(uv_lock_path):
+        try:
+            with open(uv_lock_path, 'r', encoding='utf-8') as f:
+                uv_lock_lines = len(f.readlines())
+        except Exception:
+            uv_lock_lines = 0
 
+    # 添加代码统计信息
     header += f"""
-### Bloat
-- Characters: {num_chars:,}
-- Lines: {num_lines:,}
-- Files: {num_files:,}
-- Tokens (approx): {num_tokens:,}
-- Dependencies (uv.lock lines): {uv_lock_lines:,}
+- Source Files (tracked): {num_files:,}
+- Total Lines of Code: {num_lines:,}
+- Total Characters: {num_chars:,}
+- Estimated Tokens: {num_tokens:,}
+- Dependency Lines (uv.lock): {uv_lock_lines:,}
 
 """
     return header
@@ -211,6 +250,9 @@ EXPECTED_FILES = [
     "base-model-training.md",
     "base-model-loss.md",
     "base-model-evaluation.md",
+    "mid-model-training.md",      # 加入
+    "mid-model-loss.md",        # 加入
+    "mid-model-evaluation.md",    # 加入
     "chat-sft.md",
     "chat-evaluation-sft.md",
     "chat-rl.md",
@@ -314,6 +356,9 @@ class Report:
                 # extract the most important metrics from the sections
                 if file_name == "base-model-evaluation.md":
                     final_metrics["base"] = extract(section, "CORE")
+                # 添加 mid train
+                if file_name == "mid-model-evaluation.md":
+                    final_metrics["mid"] = extract(section, "CORE")
                 if file_name == "chat-evaluation-sft.md":
                     final_metrics["sft"] = extract(section, chat_metrics)
                 if file_name == "chat-evaluation-rl.md":
@@ -333,7 +378,7 @@ class Report:
             # Custom ordering: CORE first, ChatCORE last, rest in middle
             all_metrics = sorted(all_metrics, key=lambda x: (x != "CORE", x == "ChatCORE", x))
             # Fixed column widths
-            stages = ["base", "sft", "rl"]
+            stages = ["base", "mid", "sft", "rl"] # 记得修改
             metric_width = 15
             value_width = 8
             # Write table header

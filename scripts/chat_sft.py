@@ -12,7 +12,6 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 import gc
 import argparse
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
@@ -32,6 +31,12 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
+import torch_npu  # 新增：导入NPU支持
+torch.npu.empty_cache()  # 初始化NPU缓存
+import ssl
+import urllib
+ssl._create_default_https_context = ssl._create_unverified_context
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the model")
@@ -40,9 +45,10 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
+parser.add_argument("--source", type=str, default="mid", choices=["base", "mid"], help="source checkpoint to load from (base or mid)") ### 记得修改
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
-parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from checkpoint (0=no, 1=yes)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
@@ -75,14 +81,34 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+# synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+# get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+
+if device_type == "cuda":
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=COMPUTE_DTYPE)
+    synchronize = torch.cuda.synchronize
+    get_max_memory = torch.cuda.max_memory_allocated
+elif device_type == "npu":
+    autocast_ctx = torch.npu.amp.autocast(dtype=COMPUTE_DTYPE)  # NPU autocast
+    synchronize = torch.npu.synchronize  # NPU同步函数
+    get_max_memory = torch.npu.max_memory_allocated  # NPU显存统计
+else:
+    autocast_ctx = nullcontext()
+    synchronize = lambda: None
+    get_max_memory = lambda: 0
+
+
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+elif device_type == "npu":
+    npu_device_name = torch.npu.get_device_name(0)
+    gpu_peak_flops = get_peak_flops(npu_device_name)
+    print0(f"NPU: {npu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -93,7 +119,7 @@ if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(args.source, device, phase="train", model_tag=args.model_tag, step=args.model_step)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -117,12 +143,37 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+# model = torch.compile(model, dynamic=False)  # NPU 不适用
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert args.total_batch_size % world_tokens_per_fwdbwd == 0
+# 检查total_batch_size是否能被单轮总token数整除，如果不能，则自动调整
+total_batch_size = args.total_batch_size
+if total_batch_size % world_tokens_per_fwdbwd != 0:
+    # 计算推荐的可整除值（向上取整，避免改小）
+    recommended_k = (total_batch_size + world_tokens_per_fwdbwd - 1) // world_tokens_per_fwdbwd
+    recommended_total_batch_size = recommended_k * world_tokens_per_fwdbwd
+
+    # 改为警告并自动调整
+    rank = int(os.environ.get('RANK', 0))
+    if rank == 0:
+        import warnings
+        warnings.warn(
+            f"\n===== 【NPU多卡训练参数警告】=====\n"
+            f"1. 警告原因：total_batch_size ({total_batch_size}) 无法被单轮总token数 ({world_tokens_per_fwdbwd}) 整除\n"
+            f"   - 单轮总token数计算：device_batch_size({args.device_batch_size}) × max_seq_len({args.max_seq_len}) × 卡数({ddp_world_size}) = {world_tokens_per_fwdbwd}\n"
+            f"   - 梯度累积步数必须是整数（梯度累积步数 = total_batch_size / 单轮总token数）\n"
+            f"2. 自动调整：将total_batch_size调整为 {recommended_total_batch_size}（最接近的可整数值）\n"
+            f"3. 说明：为了确保训练正常进行，系统会自动调整批量大小\n"
+            f"   - 若需手动控制，请使用可整除的total_batch_size值\n"
+            f"======================================"
+        )
+    # 自动调整到可整除值
+    total_batch_size = recommended_total_batch_size
+# 保留断言（双重保障）
+assert total_batch_size % world_tokens_per_fwdbwd == 0
+
 grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
@@ -139,7 +190,7 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    optimizer_data = load_optimizer_state(args.source, device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step) #### 记得修改
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
@@ -166,7 +217,7 @@ train_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
     CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
-    *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
+    *[MMLU(subset="auxiliary_train", split="train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
@@ -177,7 +228,7 @@ val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+]) # total: 24K + 14K + 1.32K ~= 39K rows
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
@@ -292,7 +343,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         # Apply the loss mask from render_conversation (mask=1 for assistant completions,
         # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns
         # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
-        mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
+        mask_tensor = torch.tensor(mask_rows, dtype=torch.int8) #是否需要修改？
         mask_targets = mask_tensor[:, 1:].to(device=device)
         targets[mask_targets == 0] = -1
 
@@ -517,3 +568,9 @@ get_report().log(section="SFT", data=[
 # cleanup
 wandb_run.finish() # wandb run finish
 compute_cleanup()
+
+
+# ===================== NPU适配9：训练结束清理NPU缓存 =====================
+if device_type == "npu":
+    torch.npu.empty_cache()
+    gc.collect()

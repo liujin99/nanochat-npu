@@ -9,6 +9,13 @@ import urllib.request
 import torch
 import torch.distributed as dist
 from filelock import FileLock
+# 添加SSL证书验证跳过选项，解决自签名证书问题
+import ssl
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
+
+
 
 # The dtype used for compute (matmuls, activations). Master weights stay fp32 for optimizer precision.
 # Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
@@ -18,6 +25,10 @@ def _detect_compute_dtype():
     env = os.environ.get("NANOCHAT_DTYPE")
     if env is not None:
         return _DTYPE_MAP[env], f"set via NANOCHAT_DTYPE={env}"
+    # ========== 新增：适配昇腾NPU ==========
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        # 昇腾默认用bfloat16作为计算精度
+        return torch.bfloat16, "auto-detected: Ascend NPU (bfloat16 supported for compute)"
     if torch.cuda.is_available():
         # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
         # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
@@ -159,53 +170,47 @@ def get_dist_info():
     else:
         return False, 0, 0, 1
 
+# 修复后：优先识别NPU，再GPU，最后CPU
 def autodetect_device_type():
-    # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
-    if torch.cuda.is_available():
-        device_type = "cuda"
-    elif torch.backends.mps.is_available():
-        device_type = "mps"
+    # 优先检测NPU
+    if "ASCEND_DEVICE_ID" in os.environ or (hasattr(torch, "npu") and torch.npu.is_available()):
+        return "npu"
+    # 再检测GPU
+    elif torch.cuda.is_available():
+        return "cuda"
+    # 最后CPU
     else:
-        device_type = "cpu"
-    print0(f"Autodetected device type: {device_type}")
-    return device_type
+        return "cpu"
 
-def compute_init(device_type="cuda"): # cuda|cpu|mps
-    """Basic initialization that we keep doing over and over, so make common."""
+# 昇腾NPU分布式初始化（HCCL）
+def compute_init(device_type):
+    """Compute DDP init and device setup, add NPU support (CANN 8.3.RC2)"""
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    ddp_rank = int(os.environ.get("RANK", 0))
+    ddp_local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    ddp_world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
-    if device_type == "cuda":
-        assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
-    if device_type == "mps":
-        assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
+    if device_type == "npu":
+        # 昇腾NPU分布式初始化（HCCL）
+        import torch_npu
+        torch_npu.npu.set_device(int(os.getenv("LOCAL_RANK", 0)))
+        device = torch.device(f"npu:{os.getenv('LOCAL_RANK', 0)}")
 
-    # Reproducibility
-    # Note that we set the global seeds here, but most of the code uses explicit rng objects.
-    # The only place where global rng might be used is nn.Module initialization of the model weights.
-    torch.manual_seed(42)
-    if device_type == "cuda":
-        torch.cuda.manual_seed(42)
-    # skipping full reproducibility for now, possibly investigate slowdown later
-    # torch.use_deterministic_algorithms(True)
-
-    # Precision
-    if device_type == "cuda":
-        torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls, see https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
-
-    # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
-    is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if is_ddp_requested and device_type == "cuda":
-        device = torch.device("cuda", ddp_local_rank)
-        torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
-        dist.barrier()
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            ddp = True
+            ddp_rank = int(os.environ["RANK"])
+            ddp_local_rank = int(os.environ["LOCAL_RANK"])
+            ddp_world_size = int(os.environ["WORLD_SIZE"])
+            torch.distributed.init_process_group(backend="hccl", init_method="env://")  # HCCL替代NCCL
+    elif device_type == "cuda":
+        torch.cuda.set_device(ddp_local_rank)
+        device = torch.device(f"cuda:{ddp_local_rank}")
+        if ddp:
+            torch.distributed.init_process_group(backend="nccl")
     else:
-        device = torch.device(device_type) # mps|cpu
+        device = torch.device(device_type)
 
-    if ddp_rank == 0:
-        logger.info(f"Distributed world size: {ddp_world_size}")
-
-    return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
+    return ddp, ddp_rank, ddp_local_rank, ddp_world_size, device
 
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
@@ -229,6 +234,10 @@ def get_peak_flops(device_name: str) -> float:
 
     # Table order matters: more specific patterns first.
     _PEAK_FLOPS_TABLE = (
+        # 昇腾NPU
+        (["910b3", "ascend"], 3.2e14),  # 昇腾910B3 FP16峰值FLOPS（https://developer.huawei.com/consumer/cn/blog/topic/03202360837318320）
+        (["910b", "ascend"], 3.2e14),   # 昇腾910B FP16峰值FLOPS
+        (["910", "ascend"], 2.56e14),    # 昇腾910 FP16峰值FLOPS
         # NVIDIA Blackwell
         (["gb200"], 2.5e15),
         (["grace blackwell"], 2.5e15),
@@ -276,3 +285,38 @@ def get_peak_flops(device_name: str) -> float:
     # Unknown GPU - return inf so MFU shows as 0% rather than a wrong guess
     logger.warning(f"Peak flops undefined for: {device_name}, MFU will show as 0%")
     return float('inf')
+
+
+# 新增获取 Hugging Face 令牌的工具函数，解决 HF API 限流问题
+def get_hf_token():
+    """
+    获取Hugging Face令牌，用于避免API限流
+    优先级：环境变量HF_TOKEN > ~/.huggingface/token
+    """
+    # 从环境变量获取
+    if os.environ.get("HF_TOKEN"):
+        return os.environ.get("HF_TOKEN")
+
+    # 从~/.huggingface/token文件获取
+    token_path = os.path.join(os.path.expanduser("~"), ".huggingface", "token")
+    if os.path.exists(token_path):
+        try:
+            with open(token_path, "r") as f:
+                token = f.read().strip()
+            if token:
+                return token
+        except Exception:
+            pass
+
+    # 无令牌
+    return None
+
+hf_token = get_hf_token()
+
+# 自定义设备检测，优先支持NPU
+# def autodetect_device_type_custom():
+#     if args.device_type == "npu":
+#         return "npu"
+#     if hasattr(torch, "npu") and torch.npu.is_available():
+#         return "npu"
+#     return autodetect_device_type()

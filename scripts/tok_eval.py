@@ -4,6 +4,22 @@ Evaluate compression ratio of the tokenizer.
 
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
 from nanochat.dataset import parquets_iter_batched
+import ssl
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+
+# 1. 全局禁用Python的SSL证书验证
+ssl._create_default_https_context = ssl._create_unverified_context
+# 2. 禁用requests的SSL警告
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# 3. 覆盖requests的默认Session，强制禁用SSL验证
+original_requests_get = requests.get
+def custom_get(*args, **kwargs):
+    kwargs['verify'] = False  # 强制禁用SSL验证
+    kwargs['timeout'] = 10    # 可选：添加超时
+    return original_requests_get(*args, **kwargs)
+requests.get = custom_get
+
 
 # Random text I got from a random website this morning
 news_text = r"""

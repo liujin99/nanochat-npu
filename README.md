@@ -1,7 +1,11 @@
-# nanochat
+# NanoChat-NPU
+
+> **基于 [karpathy/nanochat](https://github.com/karpathy/nanochat) 的昇腾 NPU 适配版本**
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
+
+NanoChat-NPU 是 NanoChat 的昇腾 NPU 适配版本，在保持原项目最小侵入式适配改造的原则下，实现了完整的 NPU 训练能力。所有适配版本均能在 **8×910B3 NPU** 下跑通。
 
 nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
 
@@ -24,6 +28,26 @@ Presently, the main focus of development is on tuning the pretraining stage, whi
 The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
 
 See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
+
+## NPU 适配说明
+
+本项目遵循**最小侵入式适配改造**原则，在昇腾 NPU 上实现了完整的 LLM 训练能力。
+
+### 环境要求
+
+- Ubuntu 22.04.5 LTS
+- CANN 8.3.RC2
+- NPU-SMI 24.1.0.3
+- 8×910B3 NPU
+
+### 性能对比
+
+| 版本 | 设备 | 算力 | 预训练耗时 | CORE 得分 |
+|------|------|------|------------|-----------|
+| NanoChat 官方 | 8×H100 GPU | 8×989 TFLOPS | 1.8h | 0.2690 |
+| NPU 适配版 | 8×910B3 NPU | 8×320 TFLOPS | 13.8h | 0.2668 |
+
+> 详细适配说明请参阅 **[doc.md](doc.md)**，包含完整的改造清单、性能影响分析及代码修改细节。
 
 ## Getting started
 
@@ -137,6 +161,7 @@ I've published a number of guides that might contain helpful information, most r
 .
 ├── LICENSE
 ├── README.md
+├── doc.md                         # NPU 适配详细说明
 ├── dev
 │   ├── gen_synthetic_data.py       # Example synthetic data for identity
 │   ├── generate_logo.html
@@ -151,6 +176,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── dataset.py                  # Download/read utils for pretraining data
 │   ├── engine.py                   # Efficient model inference with KV Cache
 │   ├── execution.py                # Allows the LLM to execute Python code as tool
+│   ├── flash_attention.py          # FlashAttention NPU 适配版
 │   ├── gpt.py                      # The GPT nn.Module Transformer
 │   ├── logo.svg
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
@@ -172,6 +198,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── chat_rl.py                  # Chat model: reinforcement learning
 │   ├── chat_sft.py                 # Chat model: train SFT
 │   ├── chat_web.py                 # Chat model: talk to over WebUI
+│   ├── mid_train.py                # Middle training: 中训练模块 (NPU 新增)
 │   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
 │   └── tok_train.py                # Tokenizer: train it
 ├── tasks
@@ -214,6 +241,18 @@ If you find nanochat helpful in your research cite simply as:
   year = {2025},
   publisher = {GitHub},
   url = {https://github.com/karpathy/nanochat}
+}
+```
+
+If you use the NPU-adapted version, please also cite:
+
+```bibtex
+@misc{nanochat-npu,
+  author = {liujin99},
+  title = {NanoChat-NPU: Nanochat with Ascend NPU Adaptation},
+  year = {2026},
+  publisher = {GitHub},
+  url = {https://github.com/liujin99/nanochat-npu}
 }
 ```
 

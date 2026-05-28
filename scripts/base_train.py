@@ -24,6 +24,13 @@ from contextlib import contextmanager
 import wandb
 import torch
 import torch.distributed as dist
+import torch_npu  # 导入昇腾NPU插件
+torch.npu.empty_cache()  # 初始化NPU缓存
+import ssl
+import urllib
+ssl._create_default_https_context = ssl._create_unverified_context
+torch.npu.set_compile_mode(jit_compile=False)  # 禁用JIT编译
+torch.backends.cudnn.enabled = False  # 禁用cudnn，使用昇腾原生算子
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -55,7 +62,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
-parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
@@ -77,6 +84,9 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Data directory
+from nanochat.dataset import DATA_DIR as DEFAULT_DATA_DIR
+parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR, help="directory containing training data")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -85,36 +95,78 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+# synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+# get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+# if device_type == "cuda":
+#     gpu_device_name = torch.cuda.get_device_name(0)
+#     gpu_peak_flops = get_peak_flops(gpu_device_name)
+#     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+# else:
+#     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+# print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+
+# ===================== NPU适配3：调整autocast上下文 ===================== （待确定）
+if device_type == "npu":
+    autocast_ctx = torch.amp.autocast(device_type="npu", dtype=torch.bfloat16)
+    synchronize = torch.npu.synchronize  # NPU同步函数
+    get_max_memory = torch.npu.max_memory_allocated  # NPU内存获取函数
+    # 修复：规范禁用torch.compile
+    compile_disable = True
+    print0(f"NPU设备ID: {os.environ['ASCEND_DEVICE_ID']} | NPU数量: {torch.npu.device_count()}")
+elif device_type == "cuda":
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    synchronize = torch.cuda.synchronize
+    get_max_memory = torch.cuda.max_memory_allocated
+else:
+    autocast_ctx = nullcontext()
+    synchronize = lambda: None
+    get_max_memory = lambda: 0
+
+# ===================== NPU适配4：FP8强制禁用（昇腾不支持） =====================
+args.fp8 = False  # 强制禁用FP8
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
-    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
-print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+    if device_type == "npu":
+        # 获取NPU设备名称并计算峰值FLOPS
+        npu_device_name = torch.npu.get_device_name(0)
+        gpu_peak_flops = get_peak_flops(npu_device_name)
+        print0(f"NPU: {npu_device_name} | Peak FLOPS (FP16): {gpu_peak_flops:.2e}")
+    else:
+        gpu_peak_flops = float('inf')
+
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
+# FLashAttention 警告
+if device_type == "npu":
+    print0("✓ Ascend NPU SDPA (910B3) - sliding window supported")
+elif HAS_FA3:
+    print0("✓ Flash Attention 3 (Hopper GPU) - high efficiency")
+else:
+    print0("⚠️  PyTorch SDPA fallback (FA3 not available)")
+    if args.window_pattern != "L" and device_type == "cuda":
+        print0(f"⚠️  Window pattern '{args.window_pattern}' may lower GPU util")
+
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+if HAS_FA3:
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected).")
 else:
     print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    if device_type == "npu":
+        print0("WARNING: Flash Attention 3 not available (Ascend NPU does not support FA3), using Ascend FA")
     else:
         print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
+        print0("WARNING: Training will be less efficient without FA3")
+    if args.window_pattern != "L" and device_type != "npu":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
+
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -150,6 +202,10 @@ print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
+# ===================== NPU适配5：确保模型参数完全移到NPU =====================
+model = model.to(device)  # 显式将模型移到NPU
+orig_model = model  # 先赋值，避免compile后设备不一致
+
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
@@ -166,84 +222,21 @@ if resuming:
 
 # Convert Linear layers to Float8Linear if --fp8 is set
 if args.fp8:
-    if device_type != "cuda":
-        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
-    else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
-
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
-                return False
-            return True
-
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+    print0("Warning: 昇腾NPU不支持FP8训练，自动禁用--fp8 flag")
+    args.fp8 = False  # 强制禁用FP8
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
 def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
-
-    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
-    """
-    import torch.nn as nn
-
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
-    for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
-            if '.' in name:
-                parent_name, attr_name = name.rsplit('.', 1)
-                parent = model.get_submodule(parent_name)
-            else:
-                parent = model
-                attr_name = name
-            fp8_locations.append((parent, attr_name, module))
-
-    if not fp8_locations:
-        yield  # No FP8 modules, nothing to do
-        return
-
-    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
-    # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
-    for parent, attr_name, fp8_module in fp8_locations:
-        linear = Linear(
-            fp8_module.in_features,
-            fp8_module.out_features,
-            bias=fp8_module.bias is not None,
-            device="meta",  # Use meta device to avoid unnecessary VRAM allocation
-            dtype=fp8_module.weight.dtype,
-        )
-        linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
-        setattr(parent, attr_name, linear)
-
-    try:
-        yield
-    finally:
-        # Restore Float8Linear modules
-        for parent, attr_name, fp8_module in fp8_locations:
-            setattr(parent, attr_name, fp8_module)
+    """适配昇腾NPU：FP8已禁用，该上下文管理器仅做兼容"""
+    yield  # NPU无FP8，直接返回
 
 # -----------------------------------------------------------------------------
-# Compile the model
-
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# Compile the model（修复：规范禁用compile）
+if compile_disable:
+    print0(f"{device_type}禁用torch.compile，使用原生模型训练")
+else:
+    model = torch.compile(model, dynamic=False) # 仅非NPU设备编译
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -315,6 +308,23 @@ optimizer = model.setup_optimizer(
     weight_decay=weight_decay_scaled,
 )
 
+# ===================== NPU适配6：修复优化器状态迁移逻辑 =====================
+if device_type == "npu":
+    # 修复1：确保梯度张量在NPU
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is not None:
+                p.grad = p.grad.to(device, non_blocking=True)
+
+    # 修复2：正确迁移优化器状态（遍历optimizer.state而非param_group）
+    for p in model.parameters():
+        if p in optimizer.state:
+            state = optimizer.state[p]
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    optimizer.state[p][k] = v.to(device, non_blocking=True)
+
+
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
@@ -328,9 +338,15 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, tokenizer_threads=16,
+    tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device,tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir )
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+
+# ===================== NPU适配7：异步传输数据到NPU =====================
+x = x.to(device, non_blocking=True)
+y = y.to(device, non_blocking=True)
+
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -368,18 +384,11 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
+# Momentum scheduler for Muon optimizer (warms up to 0.97 over the first 400 steps)
 def get_muon_momentum(it):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    warmdown_start = num_iterations - warmdown_iters
-    if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
-    else:
-        return 0.97
+    frac = min(it / 400, 1)
+    momentum = (1 - frac) * 0.85 + frac * 0.97
+    return momentum
 
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
@@ -406,6 +415,29 @@ else:
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+# 检查total_batch_size是否能被单轮总token数整除，如果不能，则自动调整
+if total_batch_size % world_tokens_per_fwdbwd != 0:
+    # 计算推荐的可整除值（向上取整，避免改小）
+    recommended_k = (total_batch_size + world_tokens_per_fwdbwd - 1) // world_tokens_per_fwdbwd
+    recommended_total_batch_size = recommended_k * world_tokens_per_fwdbwd
+
+    # 改为警告并自动调整
+    rank = int(os.environ.get('RANK', 0))
+    if rank == 0:
+        import warnings
+        warnings.warn(
+            f"\n===== 【NPU多卡训练参数警告】=====\n"
+            f"1. 警告原因：total_batch_size ({total_batch_size}) 无法被单轮总token数 ({world_tokens_per_fwdbwd}) 整除\n"
+            f"   - 单轮总token数计算：device_batch_size({args.device_batch_size}) × max_seq_len({args.max_seq_len}) × 卡数({ddp_world_size}) = {world_tokens_per_fwdbwd}\n"
+            f"   - 梯度累积步数必须是整数（梯度累积步数 = total_batch_size / 单轮总token数）\n"
+            f"2. 自动调整：将total_batch_size调整为 {recommended_total_batch_size}（最接近的可整数值）\n"
+            f"3. 说明：为了确保训练正常进行，系统会自动调整批量大小\n"
+            f"   - 若需手动控制，请使用可整除的total_batch_size值\n"
+            f"======================================"
+        )
+    # 自动调整到可整除值
+    total_batch_size = recommended_total_batch_size
+# 保留断言（双重保障）
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
@@ -516,6 +548,9 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # ===================== NPU适配8：预取数据移到NPU =====================
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -628,3 +663,8 @@ get_report().log(section="Base model training", data=[
 # cleanup
 wandb_run.finish() # wandb run finish
 compute_cleanup()
+
+# ===================== NPU适配9：训练结束清理NPU缓存 =====================
+if device_type == "npu":
+    torch.npu.empty_cache()
+    gc.collect()

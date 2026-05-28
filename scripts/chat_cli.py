@@ -9,6 +9,11 @@ import torch
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
+import torch_npu
+import torch.distributed as dist
+import os
+import sys
+import select
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
@@ -24,6 +29,14 @@ args = parser.parse_args()
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+is_master = (ddp_rank == 0)
+# 混合精度
+# ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
+# if device_type == "npu":
+#     autocast_ctx = torch.npu.amp.autocast(dtype=ptdtype)
+# else:
+#     autocast_ctx = nullcontext()
+
 model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
 
 # Special tokens for the chat state machine
@@ -34,11 +47,11 @@ assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>")
 # Create Engine for efficient generation
 engine = Engine(model, tokenizer)
 
-print("\nNanoChat Interactive Mode")
-print("-" * 50)
-print("Type 'quit' or 'exit' to end the conversation")
-print("Type 'clear' to start a new conversation")
-print("-" * 50)
+if is_master:
+    print("\nNanoChat (昇腾NPU多卡修复版, Rank {}/{})".format(ddp_rank, ddp_world_size))
+    print("-" * 60)
+    print("Type 'quit' to exit | 'clear' to reset conversation")
+    print("-" * 60)
 
 conversation_tokens = [bos]
 

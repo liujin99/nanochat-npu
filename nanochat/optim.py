@@ -10,7 +10,14 @@ Further contributions from @karpathy and @chrisjmccormick.
 import torch
 import torch.distributed as dist
 from torch import Tensor
-from nanochat.common import COMPUTE_DTYPE
+
+# ===================== NPU适配1：全局禁用编译，设置NPU兼容配置 =====================
+torch._dynamo.config.disable = True
+torch._dynamo.config.verbose = False
+torch.jit.enable_onednn_fusion(False)
+if hasattr(torch, "npu") and torch.npu.is_available():
+    torch.npu.set_compile_mode(jit_compile=False)
+    torch.backends.cudnn.enabled = False
 
 # -----------------------------------------------------------------------------
 """
@@ -18,7 +25,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+# @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -35,12 +42,58 @@ def adamw_step_fused(
     Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
+    适配昇腾NPU：
+    1. 移除torch.compile装饰器
+    2. 强制所有输入张量到参数p的设备（NPU）
+    3. 0-D张量不再强制CPU，改为和参数同设备
     """
+    # ===================== NPU核心修复：强制所有张量到NPU =====================
+    device = p.device  # 以参数设备为准（NPU）
+    p = p.to(device, non_blocking=True)
+    grad = grad.to(device, non_blocking=True)
+    exp_avg = exp_avg.to(device, non_blocking=True)
+    exp_avg_sq = exp_avg_sq.to(device, non_blocking=True)
+    # 0-D张量移到NPU（原代码强制CPU，导致设备不匹配）
+    step_t = step_t.to(device, non_blocking=True)
+    lr_t = lr_t.to(device, non_blocking=True)
+    beta1_t = beta1_t.to(device, non_blocking=True)
+    beta2_t = beta2_t.to(device, non_blocking=True)
+    eps_t = eps_t.to(device, non_blocking=True)
+    wd_t = wd_t.to(device, non_blocking=True)
+    # ==============================================================================
     # Weight decay (decoupled, applied before the update)
     p.mul_(1 - lr_t * wd_t)
-    # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+
+    # # Update running averages (lerp_ is cleaner and fuses well)
+    # exp_avg.lerp_(grad, 1 - beta1_t)
+    # exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+
+    # ===================== 新增：lerp_精度转换（核心修复） =====================
+    # 1. 处理exp_avg.lerp_(grad, 1 - beta1_t)
+    # 保存原始精度，临时转float32执行lerp_（NPU算子兼容）
+    exp_avg_ori_dtype = exp_avg.dtype
+    grad_ori_dtype = grad.dtype
+    beta1_t_float32 = beta1_t.to(torch.float32)
+
+    # 转float32执行lerp_
+    exp_avg_float32 = exp_avg.to(torch.float32)
+    grad_float32 = grad.to(torch.float32)
+    exp_avg_float32.lerp_(grad_float32, 1 - beta1_t_float32)
+    # 转回原精度并赋值
+    exp_avg.copy_(exp_avg_float32.to(exp_avg_ori_dtype))
+
+    # 2. 处理exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    exp_avg_sq_ori_dtype = exp_avg_sq.dtype
+    beta2_t_float32 = beta2_t.to(torch.float32)
+    grad_sq_float32 = grad.square().to(torch.float32)
+
+    # 转float32执行lerp_
+    exp_avg_sq_float32 = exp_avg_sq.to(torch.float32)
+    exp_avg_sq_float32.lerp_(grad_sq_float32, 1 - beta2_t_float32)
+    # 转回原精度并赋值
+    exp_avg_sq.copy_(exp_avg_sq_float32.to(exp_avg_sq_ori_dtype))
+    # ==========================================================================
+
     # Bias corrections
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
@@ -105,16 +158,30 @@ def muon_step_fused(
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
     All in one compiled graph to eliminate Python overhead between ops.
     Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
+    适配昇腾NPU：
+    1. 移除torch.compile装饰器
+    2. 强制所有张量到参数设备（NPU）
+    3. 0-D张量改为参数设备，不再强制CPU
+    4. 修复bfloat16不支持lerp_的问题（转float32执行）
     """
-
+    # ===================== NPU适配：强制所有张量到NPU =====================
+    device = stacked_params.device
+    stacked_grads = stacked_grads.to(device, non_blocking=True)
+    stacked_params = stacked_params.to(device, non_blocking=True)
+    momentum_buffer = momentum_buffer.to(device, non_blocking=True)
+    second_momentum_buffer = second_momentum_buffer.to(device, non_blocking=True)
+    momentum_t = momentum_t.to(device, non_blocking=True)
+    lr_t = lr_t.to(device, non_blocking=True)
+    wd_t = wd_t.to(device, non_blocking=True)
+    beta2_t = beta2_t.to(device, non_blocking=True)
+    # ==============================================================================
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     # Polar express
-    # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
-    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
     if g.size(-2) > g.size(-1): # Tall matrix
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -134,7 +201,18 @@ def muon_step_fused(
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    # ===================== 核心修复：解决bfloat16 lerp_不支持问题 =====================
+    # 原报错行：second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    # 替换为：临时转float32执行lerp_，再转回原dtype
+    orig_dtype = second_momentum_buffer.dtype
+    beta2_float32 = beta2.to(torch.float32)
+    v_mean_float32 = v_mean.to(dtype=torch.float32)
+    # 转float32执行lerp_（NPU算子要求float32）
+    second_momentum_buffer_float32 = second_momentum_buffer.to(torch.float32)
+    second_momentum_buffer_float32.lerp_(v_mean_float32, 1 - beta2_float32)
+    # 转回原dtype并赋值
+    second_momentum_buffer.copy_(second_momentum_buffer_float32.to(orig_dtype))
+    # ==============================================================================
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -150,7 +228,7 @@ def muon_step_fused(
 # -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.
 # Used mostly for reference, debugging and testing.
-
+# 适配昇腾NPU：0-D张量改为参数设备，状态张量初始化时绑定NPU
 class MuonAdamW(torch.optim.Optimizer):
     """
     Combined optimizer: Muon for 2D matrix params, AdamW for others, single GPU version.
@@ -179,24 +257,39 @@ class MuonAdamW(torch.optim.Optimizer):
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
+        # ===================== NPU适配：0-D张量不再强制CPU =====================
+        # 改为根据第一个参数自动确定设备（优先NPU）
+        self._device = torch.device("cpu")
+        for group in param_groups:
+            for p in group.get('params', []):
+                if p is not None and p.device.type != "cpu":
+                    self._device = p.device
+                    break
+            if self._device.type != "cpu":
+                break
+        # 0-D张量改为参数设备（不再是CPU）
+        # ===============================================================
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         # AdamW tensors
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
         # Muon tensors
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        # =================================================================
+
 
     def _step_adamw(self, group: dict) -> None:
         """
         AdamW update for each param in the group individually.
         Lazy init the state, fill in all 0-D tensors, call the fused kernel.
+        适配昇腾NPU：状态张量初始化时绑定参数设备（NPU）
         """
         for p in group['params']:
             if p.grad is None:
@@ -207,8 +300,9 @@ class MuonAdamW(torch.optim.Optimizer):
             # State init
             if not state:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
+                # 不再用torch.zeros_like（可能默认CPU），显式指定设备
+                state['exp_avg'] = torch.zeros(p.shape, dtype=p.dtype, device=p.device)
+                state['exp_avg_sq'] = torch.zeros(p.shape, dtype=p.dtype, device=p.device)
             exp_avg = state['exp_avg']
             exp_avg_sq = state['exp_avg_sq']
             state['step'] += 1
@@ -232,6 +326,7 @@ class MuonAdamW(torch.optim.Optimizer):
         """
         Muon update for all params in the group (stacked for efficiency).
         Lazy init the state, fill in all 0-D tensors, call the fused kernel.
+        适配昇腾NPU：状态张量初始化时绑定参数设备（NPU）
         """
         params: list[Tensor] = group['params']
         if not params:
@@ -295,9 +390,12 @@ class MuonAdamW(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # Distributed version of the MuonAdamW optimizer.
 # Used for training on multiple GPUs.
-
+# 适配昇腾NPU：0-D张量改为参数设备，状态张量初始化时绑定NPU
 class DistMuonAdamW(torch.optim.Optimizer):
     """
+    适配昇腾NPU：
+    1. 0-D控制张量不再强制CPU，改为参数设备
+    2. 优化器状态初始化时绑定参数设备（NPU）
     Combined distributed optimizer: Muon for 2D matrix params, AdamW for others.
 
     See MuonAdamW for the algorithmic details of each optimizer. This class adds
@@ -353,20 +451,32 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
+        # ===================== NPU适配：0-D张量不再强制CPU =====================
+        # 改为根据第一个参数自动确定设备（优先NPU）
+        self._device = torch.device("cpu")
+        for group in param_groups:
+            for p in group.get('params', []):
+                if p is not None and p.device.type != "cpu":
+                    self._device = p.device
+                    break
+            if self._device.type != "cpu":
+                break
+        # 0-D张量改为参数设备（不再是CPU）
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=self._device)
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -381,7 +491,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 # Large params: reduce_scatter
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
+                grad_slice = torch.empty_like(grad[:rank_size], device=p.device)  # 适配NPU：指定设备
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
         return dict(param_infos=param_infos)
@@ -396,13 +506,13 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Stack grads and zero-pad to padded_num_params
         grad_stack = torch.stack([p.grad for p in params])
-        stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
+        stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device) #  适配NPU：指定设备
         stacked_grads[:len(params)].copy_(grad_stack)
         if len(params) < padded_num_params:
             stacked_grads[len(params):].zero_()
 
         # Reduce_scatter to get this rank's chunk
-        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device) # 适配NPU：指定设备
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
 
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
@@ -426,8 +536,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
             # State init
             if not state:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p_slice)
-                state['exp_avg_sq'] = torch.zeros_like(p_slice)
+                state['exp_avg'] = torch.zeros(p_slice.shape, dtype=p_slice.dtype, device=p_slice.device) # 适配NPU：指定设备
+                state['exp_avg_sq'] = torch.zeros(p_slice.shape, dtype=p_slice.dtype, device=p_slice.device) # 适配NPU：指定设备
             state['step'] += 1
 
             # Fill 0-D tensors and run fused kernel
@@ -464,14 +574,14 @@ class DistMuonAdamW(torch.optim.Optimizer):
         # Get or create group-level state
         state = self.state[p]
         if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device) # 适配NPU：指定设备
         if "second_momentum_buffer" not in state:
             state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Build output buffer for all_gather
-        updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device) # 适配NPU：指定设备
 
         if num_owned > 0:
             owned_params = [params[start_idx + i] for i in range(num_owned)]

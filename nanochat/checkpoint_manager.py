@@ -40,6 +40,23 @@ def _patch_missing_keys(model_data, model_config):
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    # =========== 新增：若目标文件夹已存在，清空已有文件夹内容（避免混淆）==============
+    if rank == 0:
+        # 先判断文件夹是否存在
+        if os.path.exists(checkpoint_dir):
+            # 遍历文件夹内所有文件/子文件夹，安全删除
+            for filename in os.listdir(checkpoint_dir):
+                file_path = os.path.join(checkpoint_dir, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                except Exception as e:
+                    logger.error(f'删除旧文件失败 {file_path}: {e}')
+            logger.info(f"已清空 checkpoint 目录: {checkpoint_dir}")
+    # ============================================================================
+
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
@@ -164,6 +181,7 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
 def load_model(source, *args, **kwargs):
     model_dir = {
         "base": "base_checkpoints",
+        "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
     }[source]
@@ -175,6 +193,7 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""
     model_dir = {
         "base": "base_checkpoints",
+        "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
     }[source]

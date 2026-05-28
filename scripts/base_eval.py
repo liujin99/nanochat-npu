@@ -30,6 +30,10 @@ import zipfile
 import tempfile
 import argparse
 import torch
+import torch_npu
+import ssl
+import urllib
+ssl._create_default_https_context = ssl._create_unverified_context
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
@@ -181,6 +185,7 @@ def main():
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path (e.g. openai-community/gpt2-xl)')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
+    parser.add_argument('--model-type', type=str, default='base', choices=['base', 'mid', 'sft', 'rl'], help='Type of model to evaluate (base, mid, sft, rl)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
@@ -197,6 +202,17 @@ def main():
     # Distributed / precision setup
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+
+    master_process = ddp_rank == 0  # 仅主进程打印日志、保存结果
+    # # ===================== NPU适配：混合精度上下文 =====================
+    # if device_type == "cuda":
+    #     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    # elif device_type == "npu":
+    #     autocast_ctx = torch.npu.amp.autocast(dtype=torch.bfloat16)  # NPU原生BF16
+    # else:
+    #     autocast_ctx = nullcontext()
+
+
     # Load model and tokenizer
     is_hf_model = args.hf_path is not None
     if is_hf_model:
@@ -206,11 +222,11 @@ def main():
         model_name = args.hf_path
         model_slug = args.hf_path.replace("/", "-")
     else:
-        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
+        model, tokenizer, meta = load_model(args.model_type, device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
-        model_name = f"base_model (step {meta['step']})"
-        model_slug = f"base_model_{meta['step']:06d}"
+        model_name = f"{args.model_type}_model (step {meta['step']})"
+        model_slug = f"{args.model_type}_model_{meta['step']:06d}"
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
@@ -314,10 +330,13 @@ def main():
     if unconditioned_samples:
         report_data.append({f"unconditioned {i}": s for i, s in enumerate(unconditioned_samples)})
 
-    get_report().log(section="Base model evaluation", data=report_data)
+    # 记得改
+    get_report().log(section=f"{args.model_type.capitalize()} model evaluation", data=report_data)
 
     compute_cleanup()
-
+    # 资源释放与优化
+    if device_type == "npu":
+        torch.npu.empty_cache()
 
 if __name__ == "__main__":
     main()
