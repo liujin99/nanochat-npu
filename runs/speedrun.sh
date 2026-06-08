@@ -141,7 +141,7 @@ model_tag=d24_0320
 
 # ===================== 中训练 =====================
 # echo -e "\n===== 模型中训练 =====\n"
-# torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.1 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
+# torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
 
 
 # echo -e "\n===== 中训练评估 =====\n"
