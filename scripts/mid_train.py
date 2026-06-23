@@ -352,8 +352,16 @@ while True:
         scaler.step(optimizer)
         scaler.update()
     else:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in model.parameters())
+        if dist.is_initialized():
+            nan_flag = torch.tensor([1.0 if has_nan else 0.0], device=model.device)
+            dist.all_reduce(nan_flag, op=dist.ReduceOp.MAX)
+            has_nan = nan_flag.item() > 0
+        if has_nan:
+            print(f"[WARNING] NaN gradients detected at step {step}, skipping optimizer.step()")
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
     model.zero_grad(set_to_none=True)
     synchronize()
     dt = time.time() - t0
