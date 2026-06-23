@@ -100,6 +100,13 @@ def adamw_step_fused(
     # Compute update and apply
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
+    
+    # NaN/Inf detection before parameter update
+    if torch.isnan(exp_avg).any() or torch.isinf(exp_avg).any() or \
+       torch.isnan(denom).any() or torch.isinf(denom).any():
+        print(f"[WARNING] NaN/Inf detected in AdamW state for parameter {p.shape}, skipping update")
+        return
+    
     p.add_(exp_avg / denom, alpha=-step_size)
 
 # -----------------------------------------------------------------------------
