@@ -354,7 +354,8 @@ while True:
     else:
         has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in model.parameters())
         if dist.is_initialized():
-            nan_flag = torch.tensor([1.0 if has_nan else 0.0], device=model.device)
+            dev = next(model.parameters()).device
+            nan_flag = torch.tensor([1.0 if has_nan else 0.0], device=dev)
             dist.all_reduce(nan_flag, op=dist.ReduceOp.MAX)
             has_nan = nan_flag.item() > 0
         if has_nan:
