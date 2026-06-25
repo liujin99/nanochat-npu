@@ -196,11 +196,15 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
-        optimizer.load_state_dict(optimizer_data)
+        try:
+            optimizer.load_state_dict(optimizer_data)
+            for group in optimizer.param_groups:
+                group["lr"] = group["lr"] * args.lr_scale
+                group["initial_lr"] = group["lr"]
+            print0("Optimizer state loaded successfully")
+        except ValueError as e:
+            print0(f"WARNING: Failed to load optimizer state ({e}), starting fresh")
         del optimizer_data
-        for group in optimizer.param_groups:
-            group["lr"] = group["lr"] * args.lr_scale
-            group["initial_lr"] = group["lr"]
     else:
         print0("WARNING: optimizer checkpoint not found")
 # -----------------------------------------------------------------------------
