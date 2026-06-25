@@ -38,6 +38,18 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    # smear_lambda defaults to 0.0 (disabled)
+    if "smear_lambda" not in model_data:
+        model_data["smear_lambda"] = torch.zeros(1)
+        log0(f"Patching missing smear_lambda in model data to 0.0")
+    # backout_lambda defaults to 0.2
+    if "backout_lambda" not in model_data:
+        model_data["backout_lambda"] = 0.2 * torch.ones(1)
+        log0(f"Patching missing backout_lambda in model data to 0.2")
+    # smear_gate.weight defaults to uniform(0.0, 0.02), shape (1, 24)
+    if "smear_gate.weight" not in model_data:
+        model_data["smear_gate.weight"] = torch.empty(1, 24).uniform_(0.0, 0.02)
+        log0(f"Patching missing smear_gate.weight in model data")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     # =========== 新增：若目标文件夹已存在，清空已有文件夹内容（避免混淆）==============
