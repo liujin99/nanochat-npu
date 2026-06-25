@@ -21,6 +21,7 @@ def _load_ascend_flash_attention():
 # 全局变量：对齐官方命名
 _ascend_fa = _load_ascend_flash_attention()
 HAS_ASCEND_FA = _ascend_fa is not None
+HAS_FA3 = False
 
 _override_impl = None
 
