@@ -100,6 +100,8 @@ class KVCache:
         self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         # Current sequence length per batch element (FA3 needs int32)
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        # Previous token embedding for smear (set during forward pass)
+        self.prev_embedding = None
 
     def reset(self):
         """Reset cache to empty state."""
