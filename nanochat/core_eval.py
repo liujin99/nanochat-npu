@@ -280,7 +280,19 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
             input_ids = stack_sequences(all_tokens, pad_token_id)
             input_ids = input_ids.to(device)
 
-            losses, predictions = forward_model(model, input_ids)
+            try:
+                losses, predictions = forward_model(model, input_ids)
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    if device.type == "npu":
+                        torch.npu.empty_cache()
+                    elif device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    for idx in chunk:
+                        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+                        correct[idx] = float(is_correct)
+                    continue
+                raise
 
             for j, idx in enumerate(chunk):
                 b, e = boundaries[j], boundaries[j + 1]
