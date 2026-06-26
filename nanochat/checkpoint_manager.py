@@ -245,6 +245,12 @@ def migrate_optimizer_state(optimizer, saved_state_dict, model, saved_param_name
     old_param_groups = saved_state_dict['param_groups']
     new_param_groups = optimizer.param_groups
 
+    log0(f"DEBUG old_param_groups: {len(old_param_groups)}, new_param_groups: {len(new_param_groups)}")
+    for i, g in enumerate(old_param_groups):
+        log0(f"  old group {i}: kind={g.get('kind', 'MISSING')}, params={len(g['params'])}")
+    for i, g in enumerate(new_param_groups):
+        log0(f"  new group {i}: kind={g.get('kind', 'MISSING')}, params={len(g['params'])}")
+
     # --- Build id→name mapping for new optimizer params ---
     id_to_name = {id(p): name for name, p in model.named_parameters()}
 
@@ -253,10 +259,17 @@ def migrate_optimizer_state(optimizer, saved_state_dict, model, saved_param_name
         old_flat_ids = [pid for g in old_param_groups for pid in g['params']]
         if len(saved_param_names) == len(old_flat_ids):
             old_id_to_name = dict(zip(old_flat_ids, saved_param_names))
+            log0(f"Using saved param_names ({len(saved_param_names)} names)")
         else:
+            log0(f"saved_param_names mismatch: {len(saved_param_names)} vs {len(old_flat_ids)}, inferring")
             old_id_to_name = _infer_old_param_names(old_param_groups, new_param_groups, model, old_state)
     else:
+        log0("No saved param_names, inferring")
         old_id_to_name = _infer_old_param_names(old_param_groups, new_param_groups, model, old_state)
+
+    log0(f"Inferred names for {len(old_id_to_name)}/{sum(len(g['params']) for g in old_param_groups)} old params")
+    for pid, name in old_id_to_name.items():
+        log0(f"  id {pid} -> {name}")
 
     # --- Build name → new_param mapping ---
     name_to_new_param = dict(model.named_parameters())
@@ -277,7 +290,11 @@ def migrate_optimizer_state(optimizer, saved_state_dict, model, saved_param_name
     migrated_count = 0
     for old_id, state in old_state.items():
         name = old_id_to_name.get(old_id)
-        if name is None or name not in name_to_new_param:
+        if name is None:
+            log0(f"  SKIP id {old_id}: no name inferred")
+            continue
+        if name not in name_to_new_param:
+            log0(f"  SKIP id {old_id} ({name}): not in new model")
             continue
         new_param = name_to_new_param[name]
         old_kind = old_id_to_kind.get(old_id, 'adamw')
@@ -285,6 +302,9 @@ def migrate_optimizer_state(optimizer, saved_state_dict, model, saved_param_name
         if old_kind == 'adamw' and new_kind == 'adamw':
             optimizer.state[new_param] = state
             migrated_count += 1
+            log0(f"  MIGRATED id {old_id} ({name}) adamw->adamw")
+        else:
+            log0(f"  SKIP id {old_id} ({name}): kind mismatch old={old_kind} new={new_kind}")
 
     # --- Migrate Muon state (stacked buffers stored in first param of each group) ---
     old_muon = [(i, g) for i, g in enumerate(old_param_groups) if g.get('kind') == 'muon']
@@ -312,6 +332,9 @@ def migrate_optimizer_state(optimizer, saved_state_dict, model, saved_param_name
                         new_s['second_momentum_buffer'] = old_state[old_first_id]['second_momentum_buffer']
                     optimizer.state[new_first_param] = new_s
                     muon_migrated += 1
+                    log0(f"  MIGRATED Muon group {old_idx}->{new_idx}: {len(new_group['params'])} params shape {new_group['params'][0].shape}")
+                else:
+                    log0(f"  SKIP Muon group {old_idx}: no momentum_buffer in state")
                 used_old_muon.add(old_idx)
                 break
 
@@ -356,11 +379,13 @@ def _infer_old_param_names(old_param_groups, new_param_groups, model, old_state)
                         break
                     if pid in old_state and 'exp_avg' in old_state[pid]:
                         if old_state[pid]['exp_avg'].shape != new_params[i].shape:
+                            log0(f"  SHAPE MISMATCH: old exp_avg {old_state[pid]['exp_avg'].shape} vs new param {new_params[i].shape} for {name}")
                             all_ok = False
                             break
                     old_id_to_name[pid] = name
                 if all_ok:
                     used_new.add(ng_idx)
+                    log0(f"  MATCHED old group ({len(old_g['params'])} params) -> new group {ng_idx}")
                     break
 
     match_groups(old_adamw, new_adamw)
