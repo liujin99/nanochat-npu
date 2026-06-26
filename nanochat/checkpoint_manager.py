@@ -52,7 +52,7 @@ def _patch_missing_keys(model_data, model_config, device=None):
         model_data["smear_gate.weight"] = torch.empty(1, 24, **kwargs).uniform_(0.0, 0.02)
         log0(f"Patching missing smear_gate.weight in model data")
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, param_names=None):
     # =========== 新增：若目标文件夹已存在，清空已有文件夹内容（避免混淆）==============
     if rank == 0:
         # 先判断文件夹是否存在
@@ -87,6 +87,9 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+        if param_names is not None:
+            names_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}_names.pt")
+            torch.save(param_names, names_path)
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
@@ -226,65 +229,70 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     return optimizer_data
 
 
-def migrate_optimizer_state(optimizer, saved_state_dict):
+def migrate_optimizer_state(optimizer, saved_state_dict, model, saved_param_names=None):
     """
     Migrate optimizer state from a checkpoint with potentially different param groups.
+    Uses parameter NAME matching (not positional) to correctly map state across
+    different optimizer group structures.
 
-    Strategy:
-    1. Flatten all param IDs from both old and new optimizers.
-       Since both iterate model.parameters() in the same order, positional matching
-       maps old param IDs to new param IDs regardless of group structure.
-    2. For AdamW state (per-param exp_avg/exp_avg_sq): copy if both old and new groups are AdamW.
-    3. For Muon state (stacked buffers in first param): match groups by param shape signature.
+    Args:
+        optimizer: the new optimizer with current param groups
+        saved_state_dict: the loaded optimizer state_dict from checkpoint
+        model: the current model (used to build name→param mapping)
+        saved_param_names: list of param names saved alongside the checkpoint (optional)
     """
     old_state = saved_state_dict['state']
     old_param_groups = saved_state_dict['param_groups']
     new_param_groups = optimizer.param_groups
 
-    # --- Build old_id → new_param mapping via positional matching on flattened lists ---
-    old_flat_ids = [pid for g in old_param_groups for pid in g['params']]
-    new_flat_params = [p for g in new_param_groups for p in g['params']]
+    # --- Build id→name mapping for new optimizer params ---
+    id_to_name = {id(p): name for name, p in model.named_parameters()}
 
-    if len(old_flat_ids) != len(new_flat_params):
-        log0(f"Parameter count mismatch: old={len(old_flat_ids)}, new={len(new_flat_params)}, starting fresh")
-        return False
+    # --- Build old_id → name mapping ---
+    if saved_param_names is not None:
+        old_flat_ids = [pid for g in old_param_groups for pid in g['params']]
+        if len(saved_param_names) == len(old_flat_ids):
+            old_id_to_name = dict(zip(old_flat_ids, saved_param_names))
+        else:
+            old_id_to_name = _infer_old_param_names(old_param_groups, new_param_groups, model, old_state)
+    else:
+        old_id_to_name = _infer_old_param_names(old_param_groups, new_param_groups, model, old_state)
 
-    old_id_to_new_param = {}
-    for old_id, new_param in zip(old_flat_ids, new_flat_params):
-        old_id_to_new_param[old_id] = new_param
+    # --- Build name → new_param mapping ---
+    name_to_new_param = dict(model.named_parameters())
 
-    # --- Precompute kind lookup for each param ID ---
+    # --- Build kind lookup ---
     old_id_to_kind = {}
     for g in old_param_groups:
-        kind = g.get('kind', 'adamw')
         for pid in g['params']:
-            old_id_to_kind[pid] = kind
-    new_id_to_kind = {}
+            old_id_to_kind[pid] = g.get('kind', 'adamw')
+    new_name_to_kind = {}
     for g in new_param_groups:
-        kind = g.get('kind', 'adamw')
         for p in g['params']:
-            new_id_to_kind[id(p)] = kind
+            name = id_to_name.get(id(p))
+            if name:
+                new_name_to_kind[name] = g.get('kind', 'adamw')
 
-    # --- Migrate per-parameter state (mainly AdamW: exp_avg, exp_avg_sq, step) ---
+    # --- Migrate AdamW state (per-param: exp_avg, exp_avg_sq, step) ---
     migrated_count = 0
     for old_id, state in old_state.items():
-        if old_id not in old_id_to_new_param:
+        name = old_id_to_name.get(old_id)
+        if name is None or name not in name_to_new_param:
             continue
-        new_param = old_id_to_new_param[old_id]
+        new_param = name_to_new_param[name]
         old_kind = old_id_to_kind.get(old_id, 'adamw')
-        new_kind = new_id_to_kind.get(id(new_param), 'adamw')
+        new_kind = new_name_to_kind.get(name, 'adamw')
         if old_kind == 'adamw' and new_kind == 'adamw':
             optimizer.state[new_param] = state
             migrated_count += 1
 
-    # --- Migrate Muon group state (stacked momentum_buffer, second_momentum_buffer) ---
-    # Build old_id → shape mapping from new params (via positional match)
-    old_id_to_shape = {old_id: p.shape for old_id, p in zip(
-        [pid for g in old_param_groups for pid in g['params']],
-        [p for g in new_param_groups for p in g['params']])}
-
+    # --- Migrate Muon state (stacked buffers stored in first param of each group) ---
     old_muon = [(i, g) for i, g in enumerate(old_param_groups) if g.get('kind') == 'muon']
     new_muon = [(i, g) for i, g in enumerate(new_param_groups) if g.get('kind') == 'muon']
+
+    old_id_to_shape = {old_id: name_to_new_param[name].shape
+                       for old_id, name in old_id_to_name.items()
+                       if name in name_to_new_param}
 
     used_old_muon = set()
     muon_migrated = 0
@@ -294,18 +302,16 @@ def migrate_optimizer_state(optimizer, saved_state_dict):
             if old_idx in used_old_muon:
                 continue
             old_shapes = tuple(old_id_to_shape.get(pid, torch.Size()) for pid in old_group['params'])
-            if old_shapes == new_shapes:
+            if old_shapes == new_shapes and len(old_group['params']) == len(new_group['params']):
                 old_first_id = old_group['params'][0]
                 new_first_param = new_group['params'][0]
-                if old_first_id in old_state:
-                    old_s = old_state[old_first_id]
-                    if 'momentum_buffer' in old_s:
-                        new_s = optimizer.state.get(new_first_param, {})
-                        new_s['momentum_buffer'] = old_s['momentum_buffer']
-                        if 'second_momentum_buffer' in old_s:
-                            new_s['second_momentum_buffer'] = old_s['second_momentum_buffer']
-                        optimizer.state[new_first_param] = new_s
-                        muon_migrated += 1
+                if old_first_id in old_state and 'momentum_buffer' in old_state[old_first_id]:
+                    new_s = optimizer.state.get(new_first_param, {})
+                    new_s['momentum_buffer'] = old_state[old_first_id]['momentum_buffer']
+                    if 'second_momentum_buffer' in old_state[old_first_id]:
+                        new_s['second_momentum_buffer'] = old_state[old_first_id]['second_momentum_buffer']
+                    optimizer.state[new_first_param] = new_s
+                    muon_migrated += 1
                 used_old_muon.add(old_idx)
                 break
 
@@ -314,3 +320,50 @@ def migrate_optimizer_state(optimizer, saved_state_dict):
     log0(f"Migrated optimizer state: {total_migrated}/{total_old} states "
          f"(AdamW: {migrated_count}, Muon groups: {muon_migrated})")
     return total_migrated > 0
+
+
+def _infer_old_param_names(old_param_groups, new_param_groups, model, old_state):
+    """
+    Infer old param names by matching groups by shape signature,
+    then using new model's param names within matched groups.
+    Fallback for old checkpoints that don't have saved param names.
+    """
+    id_to_name = {id(p): name for name, p in model.named_parameters()}
+
+    old_adamw = [g for g in old_param_groups if g.get('kind') != 'muon']
+    new_adamw = [g for g in new_param_groups if g.get('kind') != 'muon']
+    old_muon = [g for g in old_param_groups if g.get('kind') == 'muon']
+    new_muon = [g for g in new_param_groups if g.get('kind') == 'muon']
+
+    old_id_to_name = {}
+
+    def match_groups(old_groups, new_groups):
+        used_new = set()
+        for old_g in old_groups:
+            for ng_idx, new_g in enumerate(new_groups):
+                if ng_idx in used_new:
+                    continue
+                if len(old_g['params']) != len(new_g['params']):
+                    continue
+                new_params = new_g['params']
+                all_ok = True
+                for i, pid in enumerate(old_g['params']):
+                    if pid in old_id_to_name:
+                        continue
+                    name = id_to_name.get(id(new_params[i]))
+                    if name is None:
+                        all_ok = False
+                        break
+                    if pid in old_state and 'exp_avg' in old_state[pid]:
+                        if old_state[pid]['exp_avg'].shape != new_params[i].shape:
+                            all_ok = False
+                            break
+                    old_id_to_name[pid] = name
+                if all_ok:
+                    used_new.add(ng_idx)
+                    break
+
+    match_groups(old_adamw, new_adamw)
+    match_groups(old_muon, new_muon)
+
+    return old_id_to_name
