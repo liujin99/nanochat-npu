@@ -209,7 +209,7 @@ def prepare_example(idx, data, tokenizer, task_meta, max_seq_len=None):
                 new_end_idxs.append(e)
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
-    return tokens, start_idxs, end_idxs, task_type, item['gold']
+    return tokens, start_idxs, end_idxs, task_type, item.get('gold')
 
 
 def judge_example(losses, predictions, input_ids, local_start_idxs, local_end_idxs, task_type, gold):
