@@ -161,6 +161,10 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
             data = data[:max_per_task]
 
         accuracy = evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=core_eval_batch_size)
+        if device.type == "npu":
+            torch.npu.empty_cache()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
