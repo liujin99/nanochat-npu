@@ -21,7 +21,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, \
     get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, get_dist_info
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, migrate_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -196,33 +196,11 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
-        saved_param_names = None
-        try:
-            from nanochat.checkpoint_manager import find_largest_model, find_last_step
-            _tag = args.model_tag or find_largest_model(os.path.join(get_base_dir(), "base_checkpoints"))
-            _step = args.model_step or find_last_step(os.path.join(get_base_dir(), "base_checkpoints", _tag))
-            _names_path = os.path.join(get_base_dir(), "base_checkpoints", _tag,
-                                       f"optim_{_step:06d}_rank{ddp_rank:d}_names.pt")
-            if os.path.exists(_names_path):
-                saved_param_names = torch.load(_names_path, map_location=device)
-                print0(f"Loaded saved param names from {_names_path}")
-        except Exception:
-            pass
-
-        try:
-            optimizer.load_state_dict(optimizer_data)
-            print0("Optimizer state loaded successfully (exact match)")
-        except ValueError as e:
-            print0(f"Optimizer group mismatch ({e}), attempting name-based migration...")
-            migrated = migrate_optimizer_state(optimizer, optimizer_data, orig_model, saved_param_names)
-            if migrated:
-                print0("Optimizer state migrated from checkpoint (name-based)")
-            else:
-                print0("WARNING: Could not migrate optimizer state, starting fresh")
+        optimizer.load_state_dict(optimizer_data)
+        del optimizer_data
         for group in optimizer.param_groups:
             group["lr"] = group["lr"] * args.lr_scale
             group["initial_lr"] = group["lr"]
-        del optimizer_data
     else:
         print0("WARNING: optimizer checkpoint not found")
 # -----------------------------------------------------------------------------
@@ -329,7 +307,6 @@ while True:
             "window_pattern": model.config.window_pattern,
         }
 
-        param_names = [name for name, _ in orig_model.named_parameters()]
         save_checkpoint(
             checkpoint_dir, step, orig_model.state_dict(), optimizer.state_dict(), {
                 "step": step, "val_bpb": val_bpb,
@@ -338,7 +315,7 @@ while True:
                 "device_batch_size": args.device_batch_size,
                 "total_batch_size": total_batch_size
             },
-            rank=ddp_rank, param_names=param_names)
+            rank=ddp_rank)
 
     if last_step:
         break
