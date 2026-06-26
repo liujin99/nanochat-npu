@@ -224,3 +224,93 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     log0(f"Loading optimizer state from {optimizer_path}")
     optimizer_data = torch.load(optimizer_path, map_location=device)
     return optimizer_data
+
+
+def migrate_optimizer_state(optimizer, saved_state_dict):
+    """
+    Migrate optimizer state from a checkpoint with potentially different param groups.
+
+    Strategy:
+    1. Flatten all param IDs from both old and new optimizers.
+       Since both iterate model.parameters() in the same order, positional matching
+       maps old param IDs to new param IDs regardless of group structure.
+    2. For AdamW state (per-param exp_avg/exp_avg_sq): copy if both old and new groups are AdamW.
+    3. For Muon state (stacked buffers in first param): match groups by param shape signature.
+    """
+    old_state = saved_state_dict['state']
+    old_param_groups = saved_state_dict['param_groups']
+    new_param_groups = optimizer.param_groups
+
+    # --- Build old_id → new_param mapping via positional matching on flattened lists ---
+    old_flat_ids = [pid for g in old_param_groups for pid in g['params']]
+    new_flat_params = [p for g in new_param_groups for p in g['params']]
+
+    if len(old_flat_ids) != len(new_flat_params):
+        log0(f"Parameter count mismatch: old={len(old_flat_ids)}, new={len(new_flat_params)}, starting fresh")
+        return False
+
+    old_id_to_new_param = {}
+    for old_id, new_param in zip(old_flat_ids, new_flat_params):
+        old_id_to_new_param[old_id] = new_param
+
+    # --- Precompute kind lookup for each param ID ---
+    old_id_to_kind = {}
+    for g in old_param_groups:
+        kind = g.get('kind', 'adamw')
+        for pid in g['params']:
+            old_id_to_kind[pid] = kind
+    new_id_to_kind = {}
+    for g in new_param_groups:
+        kind = g.get('kind', 'adamw')
+        for p in g['params']:
+            new_id_to_kind[id(p)] = kind
+
+    # --- Migrate per-parameter state (mainly AdamW: exp_avg, exp_avg_sq, step) ---
+    migrated_count = 0
+    for old_id, state in old_state.items():
+        if old_id not in old_id_to_new_param:
+            continue
+        new_param = old_id_to_new_param[old_id]
+        old_kind = old_id_to_kind.get(old_id, 'adamw')
+        new_kind = new_id_to_kind.get(id(new_param), 'adamw')
+        if old_kind == 'adamw' and new_kind == 'adamw':
+            optimizer.state[new_param] = state
+            migrated_count += 1
+
+    # --- Migrate Muon group state (stacked momentum_buffer, second_momentum_buffer) ---
+    # Build old_id → shape mapping from new params (via positional match)
+    old_id_to_shape = {old_id: p.shape for old_id, p in zip(
+        [pid for g in old_param_groups for pid in g['params']],
+        [p for g in new_param_groups for p in g['params']])}
+
+    old_muon = [(i, g) for i, g in enumerate(old_param_groups) if g.get('kind') == 'muon']
+    new_muon = [(i, g) for i, g in enumerate(new_param_groups) if g.get('kind') == 'muon']
+
+    used_old_muon = set()
+    muon_migrated = 0
+    for new_idx, new_group in new_muon:
+        new_shapes = tuple(p.shape for p in new_group['params'])
+        for old_idx, old_group in old_muon:
+            if old_idx in used_old_muon:
+                continue
+            old_shapes = tuple(old_id_to_shape.get(pid, torch.Size()) for pid in old_group['params'])
+            if old_shapes == new_shapes:
+                old_first_id = old_group['params'][0]
+                new_first_param = new_group['params'][0]
+                if old_first_id in old_state:
+                    old_s = old_state[old_first_id]
+                    if 'momentum_buffer' in old_s:
+                        new_s = optimizer.state.get(new_first_param, {})
+                        new_s['momentum_buffer'] = old_s['momentum_buffer']
+                        if 'second_momentum_buffer' in old_s:
+                            new_s['second_momentum_buffer'] = old_s['second_momentum_buffer']
+                        optimizer.state[new_first_param] = new_s
+                        muon_migrated += 1
+                used_old_muon.add(old_idx)
+                break
+
+    total_old = len(old_state)
+    total_migrated = migrated_count + muon_migrated
+    log0(f"Migrated optimizer state: {total_migrated}/{total_old} states "
+         f"(AdamW: {migrated_count}, Muon groups: {muon_migrated})")
+    return total_migrated > 0

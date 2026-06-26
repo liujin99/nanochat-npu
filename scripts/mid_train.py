@@ -21,7 +21,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, \
     get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, get_dist_info
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, migrate_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -198,12 +198,17 @@ if args.load_optimizer:
     if optimizer_data is not None:
         try:
             optimizer.load_state_dict(optimizer_data)
-            for group in optimizer.param_groups:
-                group["lr"] = group["lr"] * args.lr_scale
-                group["initial_lr"] = group["lr"]
-            print0("Optimizer state loaded successfully")
+            print0("Optimizer state loaded successfully (exact match)")
         except ValueError as e:
-            print0(f"WARNING: Failed to load optimizer state ({e}), starting fresh")
+            print0(f"Optimizer group mismatch ({e}), attempting parameter-level migration...")
+            migrated = migrate_optimizer_state(optimizer, optimizer_data)
+            if migrated:
+                print0("Optimizer state partially migrated from checkpoint")
+            else:
+                print0("WARNING: Could not migrate optimizer state, starting fresh")
+        for group in optimizer.param_groups:
+            group["lr"] = group["lr"] * args.lr_scale
+            group["initial_lr"] = group["lr"]
         del optimizer_data
     else:
         print0("WARNING: optimizer checkpoint not found")
