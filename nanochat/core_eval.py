@@ -263,8 +263,10 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
             is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
             correct[idx] = float(is_correct)
     else:
-        for chunk_start in range(0, len(my_indices), eval_batch_size):
-            chunk = my_indices[chunk_start:chunk_start + eval_batch_size]
+        current_batch_size = eval_batch_size
+        chunk_start = 0
+        while chunk_start < len(my_indices):
+            chunk = my_indices[chunk_start:chunk_start + current_batch_size]
 
             all_tokens = []
             all_meta = []
@@ -288,9 +290,13 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
                         torch.npu.empty_cache()
                     elif device.type == "cuda":
                         torch.cuda.empty_cache()
+                    if current_batch_size > 1:
+                        current_batch_size = max(1, current_batch_size // 2)
+                        continue
                     for idx in chunk:
                         is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
                         correct[idx] = float(is_correct)
+                    chunk_start += len(chunk)
                     continue
                 raise
 
@@ -304,6 +310,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
                     local_losses, local_preds, local_input,
                     all_meta[j][1], all_meta[j][2], task_type, gold)
                 correct[idx] = float(is_correct)
+            chunk_start += len(chunk)
 
     if world_size > 1:
         dist.barrier()
