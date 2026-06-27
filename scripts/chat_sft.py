@@ -31,8 +31,11 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
-import torch_npu  # 新增：导入NPU支持
-torch.npu.empty_cache()  # 初始化NPU缓存
+try:
+    import torch_npu  # 新增：导入NPU支持
+    torch.npu.empty_cache()  # 初始化NPU缓存
+except ImportError:
+    pass  # torch_npu not available
 import ssl
 import urllib
 ssl._create_default_https_context = ssl._create_unverified_context

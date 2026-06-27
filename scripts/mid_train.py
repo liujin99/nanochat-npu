@@ -30,9 +30,11 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
     tokenizing_distributed_data_loader_with_state_bos_bestfit
 from scripts.base_eval import evaluate_core
 
-import torch_npu
-
-torch.npu.empty_cache()
+try:
+    import torch_npu
+    torch.npu.empty_cache()
+except ImportError:
+    pass  # torch_npu not available
 import ssl
 import urllib
 

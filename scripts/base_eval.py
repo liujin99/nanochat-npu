@@ -30,7 +30,10 @@ import zipfile
 import tempfile
 import argparse
 import torch
-import torch_npu
+try:
+    import torch_npu
+except ImportError:
+    pass  # torch_npu not available
 import ssl
 import urllib
 ssl._create_default_https_context = ssl._create_unverified_context

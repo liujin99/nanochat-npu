@@ -9,7 +9,10 @@ import torch
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
-import torch_npu
+try:
+    import torch_npu
+except ImportError:
+    pass  # torch_npu not available
 import torch.distributed as dist
 import os
 import sys

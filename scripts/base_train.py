@@ -24,12 +24,15 @@ from contextlib import contextmanager
 import wandb
 import torch
 import torch.distributed as dist
-import torch_npu  # 导入昇腾NPU插件
-torch.npu.empty_cache()  # 初始化NPU缓存
+try:
+    import torch_npu  # 导入昇腾NPU插件
+    torch.npu.empty_cache()  # 初始化NPU缓存
+    torch.npu.set_compile_mode(jit_compile=False)  # 禁用JIT编译
+except ImportError:
+    pass  # torch_npu not available, continue without NPU support
 import ssl
 import urllib
 ssl._create_default_https_context = ssl._create_unverified_context
-torch.npu.set_compile_mode(jit_compile=False)  # 禁用JIT编译
 torch.backends.cudnn.enabled = False  # 禁用cudnn，使用昇腾原生算子
 
 from nanochat.gpt import GPT, GPTConfig, Linear
