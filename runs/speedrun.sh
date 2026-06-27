@@ -15,6 +15,10 @@ NANOCHAT_ROOT=$(dirname "$SCRIPT_DIR")
 # 切换到项目根目录，配置Python路径（解决ModuleNotFoundError）
 cd "$NANOCHAT_ROOT"
 
+# 激活 nano conda 环境
+eval "$(conda shell.bash hook)"
+conda activate nano
+
 
 # 加载昇腾CANN环境（适配CANN-8.3.RC2）
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
