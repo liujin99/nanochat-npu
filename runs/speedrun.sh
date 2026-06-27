@@ -15,9 +15,8 @@ NANOCHAT_ROOT=$(dirname "$SCRIPT_DIR")
 # 切换到项目根目录，配置Python路径（解决ModuleNotFoundError）
 cd "$NANOCHAT_ROOT"
 
-# 激活 nano conda 环境
-eval "$(conda shell.bash hook)"
-conda activate nano
+# 使用 nano conda 环境的绝对路径（避免 conda activate 不生效）
+export PATH="/home/ma-user/.conda/envs/nano/bin:$PATH"
 
 
 # 加载昇腾CANN环境（适配CANN-8.3.RC2）
@@ -137,19 +136,19 @@ wait $DATASET_DOWNLOAD_PID2
 
 # ===================== 基础训练 =====================
 echo -e "\n===== 基础模型训练 =====\n"
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=9.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500  --sample-every=500
+python -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=9.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500  --sample-every=500
 
 echo -e "\n===== 基础模型评估 =====\n"
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32  --model-tag $model_tag --model-type=base
+python -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32  --model-tag $model_tag --model-type=base
 
 
 # ===================== 中训练 =====================
 echo -e "\n===== 模型中训练 =====\n"
-torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
+python -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
 
 
 echo -e "\n===== 中训练评估 =====\n"
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32 --model-tag $model_tag --model-type=mid  # --max-per-task=-1
+python -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32 --model-tag $model_tag --model-type=mid  # --max-per-task=-1
 
 
 # # ===================== sft训练 =====================
