@@ -116,8 +116,8 @@ model_tag=d24_0320
 
 # ===================== 基础训练&中训练数据集下载 =====================
 echo -e "\n===== 基础训练集下载 =====\n"
-python -m nanochat.dataset -n 8
-python -m nanochat.dataset -n 170 &
+python -m nanochat.dataset -n 8 -d base
+python -m nanochat.dataset -n 170 -d base &
 DATASET_DOWNLOAD_PID=$!
 echo -e "\n===== 中训练数据集下载 =====\n"
 python -m nanochat.dataset -n 30 -d mid_train &
