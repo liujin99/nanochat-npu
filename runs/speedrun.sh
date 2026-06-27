@@ -112,29 +112,28 @@ fi
 
 
 # ===================== 模型tag & 报告重置 =====================
-# model_tag=d24_0326
-model_tag=d24_0320
+model_tag=d24_0627
 
 # echo -e "\n===== 重置报告 =====\n"
-# python -m nanochat.report reset
+# $PYTHON -m nanochat.report reset
 
 
-# ===================== 基础训练&中训练数据集下载 =====================
-echo -e "\n===== 基础训练集下载 =====\n"
-$PYTHON -m nanochat.dataset -n 8 -d base
-$PYTHON -m nanochat.dataset -n 170 -d base &
-DATASET_DOWNLOAD_PID=$!
-echo -e "\n===== 中训练数据集下载 =====\n"
-$PYTHON -m nanochat.dataset -n 30 -d mid_train &
-DATASET_DOWNLOAD_PID2=$!
+# # ===================== 基础训练&中训练数据集下载 =====================
+# echo -e "\n===== 基础训练集下载 =====\n"
+# $PYTHON -m nanochat.dataset -n 8 -d base
+# $PYTHON -m nanochat.dataset -n 170 -d base &
+# DATASET_DOWNLOAD_PID=$!
+# echo -e "\n===== 中训练数据集下载 =====\n"
+# $PYTHON -m nanochat.dataset -n 30 -d mid_train &
+# DATASET_DOWNLOAD_PID2=$!
 
 
-# ===================== tokenizer训练 =====================
-echo -e "\n===== tokenizer训练 =====\n"
-$PYTHON -m scripts.tok_train
-$PYTHON -m scripts.tok_eval
-wait $DATASET_DOWNLOAD_PID
-wait $DATASET_DOWNLOAD_PID2
+# # ===================== tokenizer训练 =====================
+# echo -e "\n===== tokenizer训练 =====\n"
+# $PYTHON -m scripts.tok_train
+# $PYTHON -m scripts.tok_eval
+# wait $DATASET_DOWNLOAD_PID
+# wait $DATASET_DOWNLOAD_PID2
 
 # ===================== 基础训练 =====================
 echo -e "\n===== 基础模型训练 =====\n"
@@ -144,13 +143,13 @@ echo -e "\n===== 基础模型评估 =====\n"
 $PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32  --model-tag $model_tag --model-type=base
 
 
-# ===================== 中训练 =====================
-echo -e "\n===== 模型中训练 =====\n"
-$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
+# # ===================== 中训练 =====================
+# echo -e "\n===== 模型中训练 =====\n"
+# $PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
 
 
-echo -e "\n===== 中训练评估 =====\n"
-$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32 --model-tag $model_tag --model-type=mid  # --max-per-task=-1
+# echo -e "\n===== 中训练评估 =====\n"
+# $PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32 --model-tag $model_tag --model-type=mid  # --max-per-task=-1
 
 
 # # ===================== sft训练 =====================
@@ -167,7 +166,7 @@ $PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base
 # $PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft -g $model_tag --b=32
 
 
-# # # ===================== 模型对话 =====================
+# # ===================== 模型对话 =====================
 # echo -e "\n===== 模型对话 =====\n"
 # $PYTHON -m scripts.chat_cli -g $model_tag   -p "Why is the sky orange?"
 $PYTHON -m scripts.chat_cli -g $model_tag
@@ -175,9 +174,9 @@ $PYTHON -m scripts.chat_cli -g $model_tag
 
 
 # # web对话（暂不支持）
-# # python -m scripts.chat_web
+# # $PYTHON -m scripts.chat_web
 
 
 # # ===================== 报告生成 =====================
 # echo -e "\n===== 报告生成 =====\n"
-# python -m nanochat.report generate
+# $PYTHON -m nanochat.report generate
