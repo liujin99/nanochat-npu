@@ -18,6 +18,7 @@ cd "$NANOCHAT_ROOT"
 # 使用 nano conda 环境的绝对路径（避免 conda activate 不生效）
 PYTHON="/home/ma-user/.conda/envs/nano/bin/python"
 export PATH="/home/ma-user/.conda/envs/nano/bin:$PATH"
+export PYTHON_EXECUTABLE="$PYTHON"  # 强制 torch.distributed.run 使用正确的 Python
 
 
 # 加载昇腾CANN环境（适配CANN-8.3.RC2）
