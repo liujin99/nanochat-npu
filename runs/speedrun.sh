@@ -114,38 +114,38 @@ model_tag=d24_0320
 # python -m nanochat.report reset
 
 
-# # ===================== 基础训练&中训练数据集下载 =====================
-# echo -e "\n===== 基础训练集下载 =====\n"
-# python -m nanochat.dataset -n 8
-# python -m nanochat.dataset -n 170 &
-# DATASET_DOWNLOAD_PID=$!
-# echo -e "\n===== 中训练数据集下载 =====\n"
-# python -m nanochat.dataset -n 30 -d mid_train &
-# DATASET_DOWNLOAD_PID2=$!
+# ===================== 基础训练&中训练数据集下载 =====================
+echo -e "\n===== 基础训练集下载 =====\n"
+python -m nanochat.dataset -n 8
+python -m nanochat.dataset -n 170 &
+DATASET_DOWNLOAD_PID=$!
+echo -e "\n===== 中训练数据集下载 =====\n"
+python -m nanochat.dataset -n 30 -d mid_train &
+DATASET_DOWNLOAD_PID2=$!
 
 
-# # ===================== tokenizer训练 =====================
-# echo -e "\n===== tokenizer训练 =====\n"
-# python -m scripts.tok_train
-# python -m scripts.tok_eval
-# wait $DATASET_DOWNLOAD_PID
-# wait $DATASET_DOWNLOAD_PID2
+# ===================== tokenizer训练 =====================
+echo -e "\n===== tokenizer训练 =====\n"
+python -m scripts.tok_train
+python -m scripts.tok_eval
+wait $DATASET_DOWNLOAD_PID
+wait $DATASET_DOWNLOAD_PID2
 
-# # ===================== 基础训练 =====================
-# echo -e "\n===== 基础模型训练 =====\n"
-# torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=9.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500  --sample-every=500
+# ===================== 基础训练 =====================
+echo -e "\n===== 基础模型训练 =====\n"
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=9.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500  --sample-every=500
 
-# echo -e "\n===== 基础模型评估 =====\n"
-# torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32  --model-tag $model_tag --model-type=base
+echo -e "\n===== 基础模型评估 =====\n"
+torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32  --model-tag $model_tag --model-type=base
 
 
 # ===================== 中训练 =====================
-# echo -e "\n===== 模型中训练 =====\n"
-# torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
+echo -e "\n===== 模型中训练 =====\n"
+torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=8 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
 
 
-# echo -e "\n===== 中训练评估 =====\n"
-# torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32 --model-tag $model_tag --model-type=mid  # --max-per-task=-1
+echo -e "\n===== 中训练评估 =====\n"
+torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=32 --model-tag $model_tag --model-type=mid  # --max-per-task=-1
 
 
 # # ===================== sft训练 =====================
