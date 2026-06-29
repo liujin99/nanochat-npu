@@ -85,8 +85,12 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        logger.info(f"Saved optimizer state to: {optimizer_path}")
+        try:
+            torch.save(optimizer_data, optimizer_path)
+            logger.info(f"Saved optimizer state to: {optimizer_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save optimizer state to {optimizer_path}: {e}")
+            logger.warning("Model weights saved successfully, optimizer state skipped")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
