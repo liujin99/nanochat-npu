@@ -5,8 +5,10 @@ import os
 import re
 import glob
 import json
+import shutil
 import logging
 import torch
+import torch.distributed as dist
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
@@ -53,11 +55,13 @@ def _patch_missing_keys(model_data, model_config, device=None):
         log0(f"Patching missing smear_gate.weight in model data")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
-    # =========== 新增：若目标文件夹已存在，清空已有文件夹内容（避免混淆）==============
+    # =========== 所有 rank 同步等待，避免竞态条件 ==============
+    if dist.is_initialized():
+        dist.barrier()
+    # ============================================================
     if rank == 0:
-        # 先判断文件夹是否存在
+        # 若目标文件夹已存在，清空已有文件夹内容（避免混淆）
         if os.path.exists(checkpoint_dir):
-            # 遍历文件夹内所有文件/子文件夹，安全删除
             for filename in os.listdir(checkpoint_dir):
                 file_path = os.path.join(checkpoint_dir, filename)
                 try:
@@ -68,10 +72,12 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
                 except Exception as e:
                     logger.error(f'删除旧文件失败 {file_path}: {e}')
             logger.info(f"已清空 checkpoint 目录: {checkpoint_dir}")
-    # ============================================================================
-
-    if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
+    # =========== rank 0 清空完成后，所有 rank 同步等待 ==============
+    if dist.is_initialized():
+        dist.barrier()
+    # ============================================================================
+    if rank == 0:
         # Save the model state parameters
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         torch.save(model_data, model_path)
