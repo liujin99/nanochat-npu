@@ -107,7 +107,7 @@ def validate_parquet(fpath):
     except Exception:
         return False
 
-def download_single_file(index, data_dir, dataset_type):
+def download_single_file(index, data_dir, dataset_type, max_retries=3, retry_delay=5):
     if dataset_type == "climb":
         fname = index_to_filename(index)
         url = f"{BASE_URL}/{fname}"
@@ -133,38 +133,45 @@ def download_single_file(index, data_dir, dataset_type):
             print(f"Corrupt file detected: {fname}, re-downloading")
             os.remove(fpath)
 
-    try:
-        if os.path.exists(tmp_path):
-            if os.path.getsize(tmp_path) > 0:
-                resume_size = os.path.getsize(tmp_path)
-                headers = {"Range": f"bytes={resume_size}-"}
+    for attempt in range(1, max_retries + 1):
+        try:
+            if os.path.exists(tmp_path):
+                if os.path.getsize(tmp_path) > 0:
+                    resume_size = os.path.getsize(tmp_path)
+                    headers = {"Range": f"bytes={resume_size}-"}
+                else:
+                    os.remove(tmp_path)
+                    resume_size = 0
+                    headers = {}
             else:
-                os.remove(tmp_path)
                 resume_size = 0
                 headers = {}
-        else:
-            resume_size = 0
-            headers = {}
 
-        resp = GLOBAL_SESSION.get(url, stream=True, headers=headers, timeout=120)
-        resp.raise_for_status()
+            resp = GLOBAL_SESSION.get(url, stream=True, headers=headers, timeout=120)
+            resp.raise_for_status()
 
-        with open(tmp_path, 'ab', buffering=1024*1024) as f:
-            for chunk in resp.iter_content(chunk_size=16*1024*1024):
-                if chunk:
-                    f.write(chunk)
+            with open(tmp_path, 'ab', buffering=1024*1024) as f:
+                for chunk in resp.iter_content(chunk_size=16*1024*1024):
+                    if chunk:
+                        f.write(chunk)
 
-        if not validate_parquet(tmp_path):
-            print(f"Downloaded file invalid: {fname}, removing")
-            os.remove(tmp_path)
-            return False
+            if not validate_parquet(tmp_path):
+                print(f"Downloaded file invalid: {fname}, removing (attempt {attempt})")
+                os.remove(tmp_path)
+                continue
 
-        os.rename(tmp_path, fpath)
-        return True
-    except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        return False
+            os.rename(tmp_path, fpath)
+            return True
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            if attempt < max_retries:
+                import time
+                time.sleep(retry_delay * attempt)
+            else:
+                print(f"Failed to download {fname} after {max_retries} attempts: {e}")
+
+    return False
 
 # -----------------------------------------------------------------------------
 # 格式转换：把 question + answer 拼成 text
