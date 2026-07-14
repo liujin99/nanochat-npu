@@ -98,6 +98,15 @@ def parquets_iter_batched(split, start=0, step=1):
 # -----------------------------------------------------------------------------
 # Download
 # -----------------------------------------------------------------------------
+def validate_parquet(fpath):
+    try:
+        pf = pq.ParquetFile(fpath)
+        if pf.num_row_groups <= 0:
+            return False
+        return True
+    except Exception:
+        return False
+
 def download_single_file(index, data_dir, dataset_type):
     if dataset_type == "climb":
         fname = index_to_filename(index)
@@ -118,11 +127,24 @@ def download_single_file(index, data_dir, dataset_type):
     tmp_path = fpath + ".tmp"
 
     if os.path.exists(fpath):
-        return True
+        if validate_parquet(fpath):
+            return True
+        else:
+            print(f"Corrupt file detected: {fname}, re-downloading")
+            os.remove(fpath)
 
     try:
-        resume_size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
-        headers = {"Range": f"bytes={resume_size}-"} if resume_size > 0 else {}
+        if os.path.exists(tmp_path):
+            if os.path.getsize(tmp_path) > 0:
+                resume_size = os.path.getsize(tmp_path)
+                headers = {"Range": f"bytes={resume_size}-"}
+            else:
+                os.remove(tmp_path)
+                resume_size = 0
+                headers = {}
+        else:
+            resume_size = 0
+            headers = {}
 
         resp = GLOBAL_SESSION.get(url, stream=True, headers=headers, timeout=120)
         resp.raise_for_status()
@@ -132,9 +154,16 @@ def download_single_file(index, data_dir, dataset_type):
                 if chunk:
                     f.write(chunk)
 
+        if not validate_parquet(tmp_path):
+            print(f"Downloaded file invalid: {fname}, removing")
+            os.remove(tmp_path)
+            return False
+
         os.rename(tmp_path, fpath)
         return True
     except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return False
 
 # -----------------------------------------------------------------------------
@@ -290,7 +319,12 @@ if __name__ == "__main__":
         ids = list(range(n))
         print(f"Downloading ClimbMix {len(ids)} files")
         with ThreadPool(args.num_workers) as pool:
-            pool.map(lambda i: download_single_file(i, DATA_DIR, "climb"), ids)
+            results = pool.map(lambda i: download_single_file(i, DATA_DIR, "climb"), ids)
+        failed = [ids[i] for i, r in enumerate(results) if not r]
+        if failed:
+            print(f"WARNING: {len(failed)} files failed to download: shards {failed}")
+        else:
+            print(f"All {len(ids)} files downloaded successfully")
 
     elif args.dataset == "mid_train":
         os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
@@ -304,16 +338,24 @@ if __name__ == "__main__":
         # print(f"⬇️ 下载 ClimbMix: {climb_ids}")
 
         with ThreadPool(args.num_workers) as pool:
-            pool.map(lambda i: download_single_file(i, TEMP_DOWNLOAD_DIR, "climb"), climb_ids)
+            results = pool.map(lambda i: download_single_file(i, TEMP_DOWNLOAD_DIR, "climb"), climb_ids)
+        failed = [climb_ids[i] for i, r in enumerate(results) if not r]
+        if failed:
+            print(f"WARNING: {len(failed)} ClimbMix files failed: shards {failed}")
 
         climb_files = [os.path.join(TEMP_DOWNLOAD_DIR, index_to_filename(i)) for i in climb_ids]
         climb_files = [f for f in climb_files if os.path.exists(f)]
 
         # 下载 GSM8K + AQUA-RAT
+        gsm_ok = download_single_file(0, MATH_DIR, "gsm8k")
+        aqua_ok = download_single_file(0, MATH_DIR, "aqua_rat")
+        if not gsm_ok:
+            print("WARNING: GSM8K download failed")
+        if not aqua_ok:
+            print("WARNING: AQUA-RAT download failed")
+
         gsm_input = os.path.join(MATH_DIR, "gsm8k_train.parquet")
         aqua_input = os.path.join(MATH_DIR, "aqua_rat_train.parquet")
-        download_single_file(0, MATH_DIR, "gsm8k")
-        download_single_file(0, MATH_DIR, "aqua_rat")
 
         # 转换为 text 列
         gsm_out = os.path.join(MATH_DIR, "gsm8k_text.parquet")
