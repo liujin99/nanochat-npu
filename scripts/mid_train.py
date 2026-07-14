@@ -51,8 +51,8 @@ parser.add_argument("--load-optimizer", type=int, default=1,
                     help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 parser.add_argument("--num-iterations", type=int, default=-1,
                     help="number of optimization steps (-1 = calculate from other params)")
-parser.add_argument("--target-param-data-ratio", type=float, default=0.1,
-                    help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--target-param-data-ratio", type=float, default=0.5,
+                    help="calculate num_iterations to maintain data:param ratio (mid_train default=0.5, Chinchilla=20, -1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1, help="target FLOPs to train for (-1 = disable)")
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None,
@@ -190,19 +190,33 @@ def build_model_meta(depth):
 d12_ref = build_model_meta(12)
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref)
 B_REF = 2 ** 19
-weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr,
-                                  matrix_lr=args.matrix_lr, weight_decay=weight_decay_scaled)
 
-# ----------------===== 工业界正确：接续预训练最终学习率 =====----------------
+# Batch LR scale (consistent with base_train: η ∝ √(B/B_ref))
+batch_lr_scale = (total_batch_size / B_REF) ** 0.5
+if batch_lr_scale != 1.0:
+    print0(f"Batch LR scale: {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
+
+weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
+optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr * batch_lr_scale,
+                                  embedding_lr=args.embedding_lr * batch_lr_scale,
+                                  matrix_lr=args.matrix_lr * batch_lr_scale,
+                                  weight_decay=weight_decay_scaled)
+
+# ----- 接续预训练优化器状态 -----
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
+        # 预训练LR已含batch_lr_scale；仅当batch_size变化时追加缩放
+        pretrain_batch = pretrain_user_config.get("total_batch_size", total_batch_size)
+        batch_ratio = (total_batch_size / pretrain_batch) ** 0.5 if total_batch_size != pretrain_batch else 1.0
+        effective_lr_scale = args.lr_scale * batch_ratio
         for group in optimizer.param_groups:
-            group["lr"] = group["lr"] * args.lr_scale
+            group["lr"] = group["lr"] * effective_lr_scale
             group["initial_lr"] = group["lr"]
+        if effective_lr_scale != 1.0:
+            print0(f"Effective LR scale: {effective_lr_scale:.4f} (lr_scale={args.lr_scale}, batch_ratio={batch_ratio:.4f})")
     else:
         print0("WARNING: optimizer checkpoint not found")
 # -----------------------------------------------------------------------------
@@ -220,8 +234,6 @@ x = x.to(device, non_blocking=True)
 y = y.to(device, non_blocking=True)
 
 # Compute iterations
-param_counts = model.num_scaling_params()
-num_scaling_params = param_counts['total']
 if args.num_iterations > 0:
     num_iterations = args.num_iterations
 elif args.target_flops > 0:
@@ -248,7 +260,7 @@ def get_lr_multiplier(it, num_iterations):
 
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    return (1 - frac) * 0.85 + frac * 0.97
 
 
 def get_weight_decay(it):

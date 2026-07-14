@@ -26,17 +26,18 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # -----------------------------------------------------------------------------
 # Dataset configs
 # -----------------------------------------------------------------------------
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+
+BASE_URL = f"{HF_ENDPOINT}/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
 MAX_SHARD = 6542
 index_to_filename = lambda index: f"shard_{index:05d}.parquet"
 
-OPENWEBMATH_URL = "https://huggingface.co/datasets/open-web-math/open-web-math/resolve/refs%2Fconvert%2Fparquet/default/train"
+OPENWEBMATH_URL = f"{HF_ENDPOINT}/datasets/open-web-math/open-web-math/resolve/refs%2Fconvert%2Fparquet/default/train"
 OPENWEBMATH_MAX_SHARD = 113
 openwebmath_index_to_filename = lambda index: f"{index:04d}.parquet"
 
-# 你提供的直接下载链接
-GSM8K_URL = "https://huggingface.co/datasets/openai/gsm8k/resolve/main/main/train-00000-of-00001.parquet?download=true"
-AQUA_RAT_URL = "https://huggingface.co/datasets/deepmind/aqua_rat/resolve/main/raw/train-00000-of-00001.parquet?download=true"
+GSM8K_URL = f"{HF_ENDPOINT}/datasets/openai/gsm8k/resolve/main/main/train-00000-of-00001.parquet?download=true"
+AQUA_RAT_URL = f"{HF_ENDPOINT}/datasets/deepmind/aqua_rat/resolve/main/raw/train-00000-of-00001.parquet?download=true"
 
 from nanochat.common import get_base_dir
 base_dir = get_base_dir()
