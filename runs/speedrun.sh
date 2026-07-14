@@ -18,10 +18,14 @@ NANOCHAT_ROOT=$(dirname "$SCRIPT_DIR")
 # 切换到项目根目录，配置Python路径（解决ModuleNotFoundError）
 cd "$NANOCHAT_ROOT"
 
-# 使用 nano conda 环境的绝对路径（避免 conda activate 不生效）
-PYTHON="/home/ma-user/.conda/envs/nano/bin/python"
-export PATH="/home/ma-user/.conda/envs/nano/bin:$PATH"
-export PYTHON_EXECUTABLE="$PYTHON"  # 强制 torch.distributed.run 使用正确的 Python
+# 动态获取当前环境的Python路径
+PYTHON="$(command -v python3 || command -v python)"
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: python not found, please activate your conda/venv environment first"
+    exit 1
+fi
+PYTHON="$(readlink -f "$PYTHON")"
+export PYTHON_EXECUTABLE="$PYTHON"
 
 
 # 加载昇腾CANN环境（适配CANN-8.3.RC2）
