@@ -3,8 +3,10 @@ set -e
 set -o noglob  # 新增：防止空参数解析错误
 
 
-export OMP_NUM_THREADS=1
+export PYTHONWARNINGS="ignore::UserWarning:torch_npu"
+
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export OMP_NUM_THREADS=1
 mkdir -p $NANOCHAT_BASE_DIR
 
 # HuggingFace镜像源（国内环境加速下载）
