@@ -109,10 +109,22 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         if os.path.exists(file_path):
             return file_path
 
-        # Download the content as bytes
-        print(f"Downloading {url}...")
-        with urllib.request.urlopen(url) as response:
-            content = response.read() # bytes
+        # Download the content as bytes with retry
+        import time
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"Downloading {url}... (attempt {attempt})")
+                with urllib.request.urlopen(url) as response:
+                    content = response.read()
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    wait = 5 * attempt
+                    print(f"Download failed: {e}, retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(f"Failed to download {url} after {max_retries} attempts: {e}") from e
 
         # Write to local file
         with open(file_path, 'wb') as f:
