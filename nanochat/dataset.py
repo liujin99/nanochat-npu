@@ -107,7 +107,7 @@ def validate_parquet(fpath):
     except Exception:
         return False
 
-def download_single_file(index, data_dir, dataset_type, max_retries=3, retry_delay=5):
+def download_single_file(index, data_dir, dataset_type, max_retries=5, retry_delay=5):
     if dataset_type == "climb":
         fname = index_to_filename(index)
         url = f"{BASE_URL}/{fname}"
@@ -320,16 +320,31 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--dataset", choices=["base", "mid_train"], default="mid_train")
     args = parser.parse_args()
 
+    def download_with_retry(ids, data_dir, dataset_type, workers, max_rounds=3):
+        remaining = list(ids)
+        for round_idx in range(1, max_rounds + 1):
+            if not remaining:
+                break
+            round_workers = max(4, workers // round_idx)
+            print(f"Download round {round_idx}: {len(remaining)} files, {round_workers} workers")
+            with ThreadPool(round_workers) as pool:
+                results = pool.map(lambda i: download_single_file(i, data_dir, dataset_type), remaining)
+            failed = [remaining[i] for i, r in enumerate(results) if not r]
+            if not failed:
+                print(f"Round {round_idx}: all {len(remaining)} files downloaded successfully")
+                return []
+            print(f"Round {round_idx}: {len(failed)} files still failed")
+            remaining = failed
+        return remaining
+
     if args.dataset == "base":
         os.makedirs(DATA_DIR, exist_ok=True)
         n = min(args.num_files, MAX_SHARD)
         ids = list(range(n))
         print(f"Downloading ClimbMix {len(ids)} files")
-        with ThreadPool(args.num_workers) as pool:
-            results = pool.map(lambda i: download_single_file(i, DATA_DIR, "climb"), ids)
-        failed = [ids[i] for i, r in enumerate(results) if not r]
-        if failed:
-            print(f"WARNING: {len(failed)} files failed to download: shards {failed}")
+        still_failed = download_with_retry(ids, DATA_DIR, "climb", args.num_workers)
+        if still_failed:
+            print(f"WARNING: {len(still_failed)} files permanently failed: shards {still_failed}")
         else:
             print(f"All {len(ids)} files downloaded successfully")
 
@@ -348,7 +363,10 @@ if __name__ == "__main__":
             results = pool.map(lambda i: download_single_file(i, TEMP_DOWNLOAD_DIR, "climb"), climb_ids)
         failed = [climb_ids[i] for i, r in enumerate(results) if not r]
         if failed:
-            print(f"WARNING: {len(failed)} ClimbMix files failed: shards {failed}")
+            print(f"WARNING: {len(failed)} ClimbMix files failed in first round: shards {failed}")
+            still_failed = download_with_retry(failed, TEMP_DOWNLOAD_DIR, "climb", args.num_workers)
+            if still_failed:
+                print(f"WARNING: {len(still_failed)} ClimbMix files permanently failed: shards {still_failed}")
 
         climb_files = [os.path.join(TEMP_DOWNLOAD_DIR, index_to_filename(i)) for i in climb_ids]
         climb_files = [f for f in climb_files if os.path.exists(f)]
