@@ -103,6 +103,7 @@ def validate_parquet(fpath):
         pf = pq.ParquetFile(fpath)
         if pf.num_row_groups <= 0:
             return False
+        pf.read_row_group(0)
         return True
     except Exception:
         return False
