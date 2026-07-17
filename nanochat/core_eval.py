@@ -5,6 +5,7 @@ https://arxiv.org/abs/2406.11794
 TODOs:
 - All tasks ~match except for squad. We get 31% reference is 37%. Figure out why.
 """
+import re
 import random
 
 from jinja2 import Template
@@ -81,6 +82,91 @@ def render_prompts_lm(item, continuation_delimiter, fewshot_examples=None):
     # to detect the final continuation. Tokenizers...
     prompt_without = prompt_without.strip()
     return [prompt_without, prompt_with]
+
+
+# -----------------------------------------------------------------------------
+# Answer extraction utilities for generation tasks
+
+def extract_gsm8k_answer(text):
+    match = re.search(r'####\s*(\-?[0-9\.,]+)', text)
+    if match:
+        return match.group(1).replace(',', '').strip()
+    match = re.search(r'The answer is\s*(\-?[0-9\.,]+)', text)
+    if match:
+        return match.group(1).replace(',', '').strip()
+    numbers = re.findall(r'\-?[0-9]+\.?[0-9]*', text.replace(',', ''))
+    if numbers:
+        return numbers[-1]
+    return None
+
+
+def extract_math_answer(text):
+    idx = text.rfind('\\boxed{')
+    if idx >= 0:
+        depth = 1
+        for i in range(idx + 7, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[idx + 7:i].strip()
+    match = re.search(r'The\s+answer\s+is\s*(.+?)\.?', text)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def normalize_math_answer(answer):
+    answer = answer.strip().replace(',', '').replace('\\ ', '').replace('\\!', '')
+    while '{' in answer and '}' in answer:
+        answer = answer.replace('{', '').replace('}', '')
+    return answer.strip()
+
+
+def extract_answer(text, extractor_type):
+    if extractor_type == 'gsm8k':
+        return extract_gsm8k_answer(text)
+    elif extractor_type == 'math':
+        return extract_math_answer(text)
+    raise ValueError(f"Unknown answer extractor: {extractor_type}")
+
+
+def compare_answers(pred_answer, gold_answer, extractor_type):
+    if pred_answer is None or gold_answer is None:
+        return False
+    if extractor_type == 'gsm8k':
+        try:
+            return abs(float(pred_answer) - float(gold_answer)) < 1e-6
+        except (ValueError, TypeError):
+            return pred_answer == gold_answer
+    elif extractor_type == 'math':
+        pred_norm = normalize_math_answer(pred_answer)
+        gold_norm = normalize_math_answer(gold_answer)
+        if pred_norm == gold_norm:
+            return True
+        try:
+            return abs(float(pred_norm) - float(gold_norm)) < 1e-6
+        except (ValueError, TypeError):
+            return False
+    return pred_answer == gold_answer
+
+
+def render_prompt_generation(item, continuation_delimiter, fewshot_examples=None):
+    """Render few-shot ICL prompt for generation task."""
+    template_str = """
+{%- for example in fewshot_examples -%}
+{{ example.question }}{{ continuation_delimiter }}{{ example.answer }}
+
+{% endfor -%}
+{{ item.question }}{{ continuation_delimiter }}""".strip()
+    template = Template(template_str)
+    fewshot_examples = fewshot_examples or []
+    return template.render(
+        fewshot_examples=fewshot_examples,
+        continuation_delimiter=continuation_delimiter,
+        item=item
+    )
 
 
 def find_common_length(token_sequences, direction='left'):
@@ -317,3 +403,87 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     mean_correct = correct.mean().item()
     return mean_correct
+
+
+@torch.no_grad()
+def evaluate_generation_task(model, tokenizer, data, device, task_meta):
+    """
+    Evaluate a generation task (GSM8K, MATH, etc.) using autoregressive generation.
+    Renders few-shot ICL prompt, generates completion, extracts answer, compares with gold.
+    Truncates prompt (by dropping few-shot examples) if it exceeds max_seq_len - max_gen_tokens.
+    """
+    from nanochat.engine import Engine
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+    num_fewshot = task_meta['num_fewshot']
+    continuation_delimiter = task_meta['continuation_delimiter']
+    answer_extractor = task_meta.get('answer_extractor', 'gsm8k')
+    max_gen_tokens = task_meta.get('max_gen_tokens', 512)
+    label = task_meta.get('label', 'unknown')
+    max_seq_len = getattr(model, 'max_seq_len', None)
+    max_prompt_len = (max_seq_len - max_gen_tokens) if max_seq_len else None
+
+    correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    my_indices = list(range(rank, len(data), world_size))
+
+    engine = Engine(model, tokenizer)
+    bos_token_id = tokenizer.get_bos_token_id()
+
+    for count, idx in enumerate(my_indices):
+        item = data[idx]
+
+        gold_answer = extract_answer(item['answer'], answer_extractor)
+        if 'gold_answer' in item and item['gold_answer']:
+            gold_answer = item['gold_answer']
+
+        effective_fewshot = num_fewshot
+        fewshot_examples = []
+        if effective_fewshot > 0:
+            rng = random.Random(1234 + idx)
+            available_indices = [i for i in range(len(data)) if i != idx]
+            fewshot_indices = rng.sample(available_indices, min(effective_fewshot, len(available_indices)))
+            fewshot_examples = [data[i] for i in fewshot_indices]
+
+            if max_prompt_len is not None:
+                while fewshot_examples:
+                    prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
+                    prompt_tokens = tokenizer(prompt, prepend=bos_token_id)
+                    if len(prompt_tokens) <= max_prompt_len:
+                        break
+                    fewshot_examples.pop(0)
+
+        prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
+        prompt_tokens = tokenizer(prompt, prepend=bos_token_id)
+
+        if max_prompt_len and len(prompt_tokens) > max_prompt_len:
+            prompt_tokens = prompt_tokens[:max_prompt_len]
+
+        try:
+            generated, _ = engine.generate_batch(
+                prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
+            )
+            generated_text = tokenizer.decode(generated[0][len(prompt_tokens):])
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower():
+                if device.type == "npu":
+                    torch.npu.empty_cache()
+                elif device.type == "cuda":
+                    torch.cuda.empty_cache()
+                correct[idx] = 0.0
+                continue
+            raise
+
+        pred_answer = extract_answer(generated_text, answer_extractor)
+        is_correct = compare_answers(pred_answer, gold_answer, answer_extractor)
+        correct[idx] = float(is_correct)
+
+        if count % 50 == 0 and count > 0:
+            partial_acc = correct[:idx+1].mean().item()
+            print0(f"  [{label}] {count}/{len(my_indices)} examples, partial acc: {partial_acc:.4f}")
+
+    if world_size > 1:
+        dist.barrier()
+        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+    return correct.mean().item()

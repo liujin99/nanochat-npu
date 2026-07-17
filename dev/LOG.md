@@ -4,6 +4,26 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-07-17: base_train warmdown_ratio default changed from 0.65 to 0.0
+
+### Context
+
+The 2024-2025 industry trend (LLaMA 3, MiniCPM, OLMo 2, Nemotron-CLIMB) uses **constant LR pretraining + annealing only in mid_train**. The previous default of `warmdown_ratio=0.65` applied LR decay during pretraining, leaving mid_train to start from ~5% of peak LR. This "double decay" weakens annealing effectiveness and contradicts the CLIMB paper's design.
+
+### Change
+
+- `scripts/base_train.py`: `--warmdown-ratio` default changed from `0.65` → `0.0`
+- Pretraining now uses constant LR (warmup only), annealing happens exclusively in mid_train
+- Users who skip mid_train and only do pretraining should pass `--warmdown-ratio=0.65` to get LR convergence
+
+### Impact
+
+- base→mid pipeline: annealing starts from peak LR (correct CLIMB behavior)
+- standalone base_train: no LR decay by default (user must explicitly set warmdown if needed)
+- chat_sft: unaffected (SFT resets LR anyway, as noted in existing comment)
+
+---
+
 ## 2026-05-05: DyT for d12 pretraining (negative)
 
 Tried replacing normalization with [DyT](https://arxiv.org/abs/2503.10622) for d12-scale pretraining following some [hype](https://x.com/LodestoneRock/status/2050367217087512953) on X.
