@@ -125,7 +125,7 @@ STEM_TASKS = [
         'icl_task_type': 'generation',
         'continuation_delimiter': '\nAnswer: ',
         'answer_extractor': 'gsm8k',
-        'max_gen_tokens': 512,
+        'max_gen_tokens': 256,
     },
     {
         'label': 'math_cot',
@@ -134,7 +134,7 @@ STEM_TASKS = [
         'icl_task_type': 'generation',
         'continuation_delimiter': '\n\nSolution: ',
         'answer_extractor': 'math',
-        'max_gen_tokens': 512,
+        'max_gen_tokens': 256,
     },
     {
         'label': 'mmlu_zeroshot',

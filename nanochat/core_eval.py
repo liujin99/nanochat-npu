@@ -479,7 +479,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
         is_correct = compare_answers(pred_answer, gold_answer, answer_extractor)
         correct[idx] = float(is_correct)
 
-        if count % 50 == 0 and count > 0:
+        if count % 10 == 0 and count > 0:
             partial_acc = correct[:idx+1].mean().item()
             print0(f"  [{label}] {count}/{len(my_indices)} examples, partial acc: {partial_acc:.4f}")
 
