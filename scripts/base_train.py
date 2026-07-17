@@ -25,9 +25,11 @@ import wandb
 import torch
 import torch.distributed as dist
 try:
-    import torch_npu  # 导入昇腾NPU插件
-    torch.npu.empty_cache()  # 初始化NPU缓存
-    torch.npu.set_compile_mode(jit_compile=False)  # 禁用JIT编译
+    import torch_npu
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch_npu")
+    torch.npu.empty_cache()
+    torch.npu.set_compile_mode(jit_compile=False)
 except ImportError:
     pass  # torch_npu not available, continue without NPU support
 import ssl

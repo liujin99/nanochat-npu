@@ -32,9 +32,11 @@ from scripts.base_eval import evaluate_core
 
 try:
     import torch_npu
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch_npu")
     torch.npu.empty_cache()
 except ImportError:
-    pass  # torch_npu not available
+    pass
 import ssl
 import urllib
 

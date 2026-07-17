@@ -32,8 +32,10 @@ import argparse
 import torch
 try:
     import torch_npu
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch_npu")
 except ImportError:
-    pass  # torch_npu not available
+    pass
 import ssl
 import urllib
 ssl._create_default_https_context = ssl._create_unverified_context

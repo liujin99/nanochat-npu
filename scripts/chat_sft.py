@@ -32,10 +32,12 @@ from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
 try:
-    import torch_npu  # 新增：导入NPU支持
-    torch.npu.empty_cache()  # 初始化NPU缓存
+    import torch_npu
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch_npu")
+    torch.npu.empty_cache()
 except ImportError:
-    pass  # torch_npu not available
+    pass
 import ssl
 import urllib
 ssl._create_default_https_context = ssl._create_unverified_context
