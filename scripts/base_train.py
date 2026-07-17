@@ -24,10 +24,9 @@ from contextlib import contextmanager
 import wandb
 import torch
 import torch.distributed as dist
+import os; os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:torch_npu")
 try:
     import torch_npu
-    import warnings
-    warnings.filterwarnings("ignore", category=UserWarning, module="torch_npu")
     torch.npu.empty_cache()
     torch.npu.set_compile_mode(jit_compile=False)
 except ImportError:

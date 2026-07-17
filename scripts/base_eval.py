@@ -30,10 +30,9 @@ import zipfile
 import tempfile
 import argparse
 import torch
+import os; os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:torch_npu")
 try:
     import torch_npu
-    import warnings
-    warnings.filterwarnings("ignore", category=UserWarning, module="torch_npu")
 except ImportError:
     pass
 import ssl
