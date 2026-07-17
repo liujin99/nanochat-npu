@@ -145,10 +145,11 @@ STEM_DOWNLOAD_PID=$!
 # $PYTHON -m scripts.tok_train
 # $PYTHON -m scripts.tok_eval
 # wait $DATASET_DOWNLOAD_PID
-wait $DATASET_DOWNLOAD_PID2
-wait $STEM_DOWNLOAD_PID
+# wait $DATASET_DOWNLOAD_PID2
 
 # ===================== 基础训练 =====================
+wait $DATASET_DOWNLOAD_PID2
+wait $STEM_DOWNLOAD_PID
 echo -e "\n===== 基础模型训练 =====\n"
 $PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=10 --target-param-data-ratio=9.5 --device-batch-size=2 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500  --sample-every=500 --eval-benchmarks=stem
 
