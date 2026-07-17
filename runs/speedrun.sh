@@ -146,19 +146,19 @@ wait $DATASET_DOWNLOAD_PID2
 
 # ===================== 基础训练 =====================
 echo -e "\n===== 基础模型训练 =====\n"
-$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=10 --target-param-data-ratio=9.5 --device-batch-size=2 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500  --sample-every=500
+$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=10 --target-param-data-ratio=9.5 --device-batch-size=2 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500  --sample-every=500 --eval-benchmarks=stem
 
 echo -e "\n===== 基础模型评估 =====\n"
-$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16  --model-tag $model_tag --model-type=base
+$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16  --model-tag $model_tag --model-type=base --eval-benchmarks=stem
 
 
 # # ===================== 中训练 =====================
 echo -e "\n===== 模型中训练 =====\n"
-$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=2 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500
+$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.mid_train -- --target-param-data-ratio=0.5 --device-batch-size=2 --run=$WANDB_RUN  --model-tag $model_tag  --core-metric-every=500 --eval-benchmarks=stem
 
 
 echo -e "\n===== 中训练评估 =====\n"
-$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16 --model-tag $model_tag --model-type=mid  # --max-per-task=-1
+$PYTHON -m torch.distributed.run --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16 --model-tag $model_tag --model-type=mid --eval-benchmarks=stem
 
 
 # # ===================== sft训练 =====================
