@@ -282,7 +282,7 @@ def stream_mix(climb_files, math_files, out_dir, num_output_files):
     current = []
     file_idx = 0
     total = num_output_files * BATCH_PER_FILE
-    pbar = tqdm(desc="Mixing data", total=total)
+    pbar = tqdm(desc="Mixing mid_train data", total=total)
 
     try:
         while file_idx < num_output_files:
