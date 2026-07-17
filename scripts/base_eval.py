@@ -336,7 +336,6 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
       None or 'all'  : evaluate all (core + stem)
       'core'         : evaluate only DCLM core tasks
       'stem'         : evaluate only STEM benchmarks (GPQA, GSM8K, MATH_COT, MMLU)
-      'stem_mc'      : evaluate only STEM multiple_choice tasks (fast, no generation)
       comma-separated: evaluate specific benchmarks by label (e.g. 'mmlu_fewshot,gsm8k_cot')
     """
     base_dir = get_base_dir()
@@ -369,11 +368,9 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
         selected_core = core_tasks
         selected_stem = []
     elif benchmarks == 'stem':
+        # STEM preset: includes tasks matching STEM_BENCHMARK_LABELS from both core.yaml and stem data
         selected_core = [t for t in core_tasks if t['label'] in STEM_BENCHMARK_LABELS]
         selected_stem = [t for t in stem_tasks if t['label'] in STEM_BENCHMARK_LABELS]
-    elif benchmarks == 'stem_mc':
-        selected_core = [t for t in core_tasks if t['label'] in STEM_BENCHMARK_LABELS and t.get('icl_task_type') != 'generation']
-        selected_stem = [t for t in stem_tasks if t['label'] in STEM_BENCHMARK_LABELS and t.get('icl_task_type') != 'generation']
     else:
         # Specific benchmark labels
         benchmark_set = set(benchmarks)
