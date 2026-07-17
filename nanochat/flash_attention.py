@@ -192,11 +192,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
             k_cache[:, pos:pos+T_new, :, :] = k.to(k_cache.device, non_blocking=True)
             v_cache[:, pos:pos+T_new, :, :] = v.to(v_cache.device, non_blocking=True)
 
-            if is_initialized():
-                try:
-                    barrier(device_ids=[torch.npu.current_device()], timeout=10)
-                except Exception:
-                    pass
+
 
         end_pos = pos + T_new
         # 用NPU原生切片，避免CPU计算边界
