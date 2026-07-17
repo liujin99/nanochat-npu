@@ -22,9 +22,9 @@ from dataclasses import asdict
 from contextlib import contextmanager
 
 import wandb
+import warnings; warnings.filterwarnings("ignore", category=UserWarning)
 import torch
 import torch.distributed as dist
-import os; os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:torch_npu")
 try:
     import torch_npu
     torch.npu.empty_cache()

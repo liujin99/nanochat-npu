@@ -31,7 +31,7 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
-import os; os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:torch_npu")
+import warnings; warnings.filterwarnings("ignore", category=UserWarning)
 try:
     import torch_npu
     torch.npu.empty_cache()

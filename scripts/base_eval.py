@@ -28,9 +28,9 @@ import shutil
 import random
 import zipfile
 import tempfile
+import warnings; warnings.filterwarnings("ignore", category=UserWarning)
 import argparse
 import torch
-import os; os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:torch_npu")
 try:
     import torch_npu
 except ImportError:

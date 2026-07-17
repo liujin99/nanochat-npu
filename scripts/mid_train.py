@@ -30,7 +30,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
     tokenizing_distributed_data_loader_with_state_bos_bestfit
 from scripts.base_eval import evaluate_core
 
-import os; os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:torch_npu")
+import warnings; warnings.filterwarnings("ignore", category=UserWarning)
 try:
     import torch_npu
     torch.npu.empty_cache()
