@@ -75,7 +75,7 @@ parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious w
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
+parser.add_argument("--warmdown-ratio", type=float, default=0.0, help="ratio of iterations for LR warmdown (0.0 = constant LR, recommended when followed by mid_train annealing; use 0.65 for standalone pretraining without mid_train)")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
