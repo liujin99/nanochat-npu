@@ -3,7 +3,7 @@ set -e
 set -o noglob  # 新增：防止空参数解析错误
 
 
-export PYTHONWARNINGS="ignore::UserWarning:torch_npu"
+export PYTHONWARNINGS="ignore::UserWarning"
 
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export OMP_NUM_THREADS=1
