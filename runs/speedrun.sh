@@ -135,6 +135,9 @@ DATASET_DOWNLOAD_PID=$!
 echo -e "\n===== 中训练数据集下载 =====\n"
 $PYTHON -m nanochat.dataset -n 30 -d mid_train &
 DATASET_DOWNLOAD_PID2=$!
+echo -e "\n===== STEM评估数据下载 =====\n"
+$PYTHON -c "import os, sys; sys.path.insert(0, '$NANOCHAT_ROOT'); from scripts.base_eval import prepare_stem_eval_data; prepare_stem_eval_data()" &
+STEM_DOWNLOAD_PID=$!
 
 
 # # ===================== tokenizer训练 =====================
@@ -143,6 +146,7 @@ DATASET_DOWNLOAD_PID2=$!
 # $PYTHON -m scripts.tok_eval
 # wait $DATASET_DOWNLOAD_PID
 wait $DATASET_DOWNLOAD_PID2
+wait $STEM_DOWNLOAD_PID
 
 # ===================== 基础训练 =====================
 echo -e "\n===== 基础模型训练 =====\n"
