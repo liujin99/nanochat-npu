@@ -433,6 +433,8 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
     engine = Engine(model, tokenizer)
     bos_token_id = tokenizer.get_bos_token_id()
 
+    oom_flag = torch.tensor([0.0], device=device)
+
     if device.type == "npu":
         torch.npu.empty_cache()
     elif device.type == "cuda":
@@ -475,13 +477,14 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
             del generated
         except RuntimeError as e:
             err_str = str(e).lower()
-            if 'out of memory' in err_str or 'npu' in err_str and ('memory' in err_str or 'alloc' in err_str or '507048' in str(e)):
+            if 'out of memory' in err_str or ('npu' in err_str and ('memory' in err_str or 'alloc' in err_str or '507048' in str(e))):
                 if device.type == "npu":
                     torch.npu.empty_cache()
                 elif device.type == "cuda":
                     torch.cuda.empty_cache()
                 gc.collect()
                 correct[idx] = 0.0
+                oom_flag[0] = 1.0
                 print0(f"  [{label}] OOM at example {idx}, skipping")
                 continue
             raise
@@ -509,6 +512,11 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
     gc.collect()
 
     if world_size > 1:
+        dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+        any_oom = oom_flag[0].item() > 0.5
+        if any_oom:
+            print0(f"  [{label}] OOM detected on one or more ranks, skipping all_reduce for accuracy (returning partial per-rank result)")
+            return correct[:len(my_indices)].mean().item()
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     return correct.mean().item()

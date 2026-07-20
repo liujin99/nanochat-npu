@@ -167,20 +167,24 @@ class Engine:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        # Pre-allocate persistent KVCache for num_samples=1 generation (all eval paths).
+        # Eliminates repeated malloc/free that causes NPU memory fragmentation.
+        m = self.model.config
+        self._kv_cache = KVCache(
+            batch_size=1,
+            seq_len=m.sequence_len,
+            num_heads=m.n_kv_head,
+            head_dim=m.n_embd // m.n_head,
+            num_layers=m.n_layer,
+            device=self.model.get_device(),
+            dtype=COMPUTE_DTYPE,
+        )
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
-        # NOTE: setting the dtype here and in this way is an ugly hack.
-        # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
-        # We need to know the dtype here to call __init__ on KVCache and pre-allocate its tensors.
-        # As a quick hack, we're making generate() function inherit and know about this repo-wise assumption.
-        # I think there has to be a bigger refactor to deal with device/dtype tracking across the codebase.
-        # In particular, the KVCache should allocate its tensors lazily
-
-        # dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         dtype = COMPUTE_DTYPE
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
@@ -194,36 +198,44 @@ class Engine:
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
-        # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
+        if num_samples == 1:
+            # Reuse persistent KVCache: reset, prefill, decode all in same cache.
+            # No malloc/free → no NPU memory fragmentation from 150+ alloc/free cycles.
+            self._kv_cache.reset()
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            logits = self.model.forward(ids, kv_cache=self._kv_cache)
+            logits = logits[:, -1, :]  # (1, vocab_size)
+            kv_cache_decode = self._kv_cache
+        else:
+            # Two-stage: prefill batch=1, then copy to batch=num_samples decode cache
+            kv_cache_prefill = KVCache(
+                batch_size=1,
+                seq_len=len(tokens),
+                device=device,
+                dtype=dtype,
+                **kv_model_kwargs,
+            )
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+            logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+            kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+            kv_cache_decode = KVCache(
+                batch_size=num_samples,
+                seq_len=kv_length_hint,
+                device=device,
+                dtype=dtype,
+                **kv_model_kwargs,
+            )
+            kv_cache_decode.prefill(kv_cache_prefill)
+            del kv_cache_prefill # no need to keep this memory around
 
-        # 3) Initialize states for each sample
+        # Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
 
-        # 4) Main generation loop
+        # Main generation loop
         num_generated = 0
         while True:
             # Stop condition: we've reached max tokens
