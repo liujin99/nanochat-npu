@@ -169,139 +169,23 @@ def place_eval_stem(file_path):
 
 def prepare_stem_eval_data():
     """Download pre-packaged STEM evaluation data zip and extract.
-    Falls back to individual HuggingFace downloads if zip download fails.
+    Raises RuntimeError if download fails, consistent with CORE eval bundle behavior.
     """
     base_dir = get_base_dir()
     eval_stem_dir = os.path.join(base_dir, "eval_stem")
 
     if os.path.exists(eval_stem_dir):
-        return eval_stem_dir, get_available_stem_tasks(os.path.join(eval_stem_dir, "eval_data"))
+        available = get_available_stem_tasks(os.path.join(eval_stem_dir, "eval_data"))
+        if available:
+            return eval_stem_dir, available
+        print0(f"WARNING: {eval_stem_dir} exists but contains no eval data, will re-download...")
 
-    # Try downloading the pre-packaged zip first
-    try:
-        print0("Downloading STEM evaluation data package...")
-        download_file_with_lock(EVAL_STEM_URL, "eval_stem.zip", postprocess_fn=place_eval_stem)
-        return eval_stem_dir, get_available_stem_tasks(os.path.join(eval_stem_dir, "eval_data"))
-    except Exception as e:
-        print0(f"WARNING: Could not download eval_stem.zip: {e}")
-        print0("Falling back to individual dataset downloads from HuggingFace...")
-
-    # Fallback: download individual datasets from HuggingFace
-    eval_data_dir = os.path.join(eval_stem_dir, "eval_data")
-    os.makedirs(eval_data_dir, exist_ok=True)
-    print0("Preparing STEM evaluation data individually (GPQA, GSM8K, MATH-500, MMLU)...")
-
-    from datasets import load_dataset as hf_load_dataset
-    available_tasks = []
-
-    # --- GPQA Diamond ---
-    try:
-        print0("Downloading GPQA Diamond (may take a while due to large CSV)...")
-        old_timeout = os.environ.get('HF_HUB_DOWNLOAD_TIMEOUT', '')
-        os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '300'
-        gpqa_ds = hf_load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")
-        gpqa_data = []
-        rng = random.Random(42)
-        for row in gpqa_ds:
-            choices = [str(row['Correct Answer']), str(row['Incorrect Answer 1']),
-                       str(row['Incorrect Answer 2']), str(row['Incorrect Answer 3'])]
-            correct_answer = str(row['Correct Answer'])
-            rng.shuffle(choices)
-            gold = choices.index(correct_answer)
-            query = f"{row['Question']}\nChoices:\n(A) {choices[0]}\n(B) {choices[1]}\n(C) {choices[2]}\n(D) {choices[3]}"
-            gpqa_data.append({"query": query, "choices": choices, "gold": gold})
-        gpqa_path = os.path.join(eval_data_dir, "gpqa_diamond.jsonl")
-        with open(gpqa_path, 'w', encoding='utf-8') as f:
-            for item in gpqa_data:
-                f.write(json.dumps(item) + '\n')
-        print0(f"GPQA Diamond: {len(gpqa_data)} examples -> {gpqa_path}")
-        available_tasks.append('gpqa_diamond')
-    except Exception as e:
-        print0(f"WARNING: Could not download GPQA (gated dataset): {e}")
-        print0("To add GPQA manually: download from https://huggingface.co/datasets/Idavidrein/gpqa,")
-        print0("convert to JSONL format {query, choices, gold}, and place at eval_stem/eval_data/gpqa_diamond.jsonl")
-    finally:
-        if old_timeout:
-            os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = old_timeout
-        else:
-            os.environ.pop('HF_HUB_DOWNLOAD_TIMEOUT', None)
-
-    # --- GSM8K ---
-    try:
-        print0("Downloading GSM8K...")
-        gsm8k_ds = hf_load_dataset("openai/gsm8k", "main", split="test")
-        gsm8k_data = []
-        for row in gsm8k_ds:
-            gsm8k_data.append({"question": row['question'], "answer": row['answer']})
-        gsm8k_path = os.path.join(eval_data_dir, "gsm8k.jsonl")
-        with open(gsm8k_path, 'w', encoding='utf-8') as f:
-            for item in gsm8k_data:
-                f.write(json.dumps(item) + '\n')
-        print0(f"GSM8K: {len(gsm8k_data)} examples -> {gsm8k_path}")
-        available_tasks.append('gsm8k_cot')
-    except Exception as e:
-        print0(f"WARNING: Could not download GSM8K: {e}")
-
-    # --- MATH-500 ---
-    try:
-        print0("Downloading MATH-500...")
-        math_ds = hf_load_dataset("HuggingFaceH4/MATH-500", split="test")
-        math_data = []
-        for row in math_ds:
-            math_data.append({"question": row['problem'], "answer": row['solution'], "gold_answer": row['answer']})
-        math_path = os.path.join(eval_data_dir, "math500.jsonl")
-        with open(math_path, 'w', encoding='utf-8') as f:
-            for item in math_data:
-                f.write(json.dumps(item) + '\n')
-        print0(f"MATH-500: {len(math_data)} examples -> {math_path}")
-        available_tasks.append('math_cot')
-    except Exception as e:
-        print0(f"WARNING: Could not download MATH-500: {e}")
-
-    # --- MMLU (from HuggingFace, answer is int 0-3) ---
-    try:
-        print0("Downloading MMLU...")
-        mmlu_ds = hf_load_dataset("cais/mmlu", "all", split="test")
-        mmlu_data = []
-        stem_data = []
-        for row in mmlu_ds:
-            choices = row['choices']
-            correct_idx = row['answer']
-            query = f"{row['question']}\nChoices:\n(A) {choices[0]}\n(B) {choices[1]}\n(C) {choices[2]}\n(D) {choices[3]}"
-            item = {"query": query, "choices": choices, "gold": correct_idx}
-            mmlu_data.append(item)
-            if row['subject'] in STEM_SUBJECT_KEYWORDS:
-                stem_data.append(item)
-        mmlu_path = os.path.join(eval_data_dir, "mmlu.jsonl")
-        with open(mmlu_path, 'w', encoding='utf-8') as f:
-            for item in mmlu_data:
-                f.write(json.dumps(item) + '\n')
-        print0(f"MMLU zeroshot: {len(mmlu_data)} examples -> {mmlu_path}")
-        available_tasks.append('mmlu_zeroshot')
-
-        mmlu_stem_path = os.path.join(eval_data_dir, "mmlu_stem.jsonl")
-        with open(mmlu_stem_path, 'w', encoding='utf-8') as f:
-            for item in stem_data:
-                f.write(json.dumps(item) + '\n')
-        print0(f"MMLU STEM: {len(stem_data)} examples -> {mmlu_stem_path}")
-        available_tasks.append('mmlu_stem')
-    except Exception as e:
-        print0(f"WARNING: Could not download MMLU: {e}")
-
-    # --- Write eval_meta_data.csv ---
-    csv_path = os.path.join(eval_stem_dir, "eval_meta_data.csv")
-    with open(csv_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Eval Task', 'Random baseline'])
-        writer.writerow(['gpqa_diamond', '25.0'])
-        writer.writerow(['gsm8k_cot', '0.0'])
-        writer.writerow(['math_cot', '0.0'])
-        writer.writerow(['mmlu_zeroshot', '25.0'])
-        writer.writerow(['mmlu_stem', '25.0'])
-
-    print0(f"STEM evaluation data prepared at {eval_stem_dir}")
-    print0(f"Available STEM tasks: {available_tasks}")
-    return eval_stem_dir, available_tasks
+    print0("Downloading STEM evaluation data package...")
+    download_file_with_lock(EVAL_STEM_URL, "eval_stem.zip", postprocess_fn=place_eval_stem)
+    available = get_available_stem_tasks(os.path.join(eval_stem_dir, "eval_data"))
+    if not available:
+        raise RuntimeError(f"eval_stem.zip downloaded but no task data found at {eval_stem_dir}/eval_data/")
+    return eval_stem_dir, available
 
 
 def get_available_stem_tasks(eval_data_dir):

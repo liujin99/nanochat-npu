@@ -413,6 +413,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
     Renders few-shot ICL prompt, generates completion, extracts answer, compares with gold.
     Truncates prompt (by dropping few-shot examples) if it exceeds max_seq_len - max_gen_tokens.
     """
+    import gc
     from nanochat.engine import Engine
 
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -431,6 +432,11 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
 
     engine = Engine(model, tokenizer)
     bos_token_id = tokenizer.get_bos_token_id()
+
+    if device.type == "npu":
+        torch.npu.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
 
     for count, idx in enumerate(my_indices):
         item = data[idx]
@@ -466,13 +472,17 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
                 prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
             )
             generated_text = tokenizer.decode(generated[0][len(prompt_tokens):])
+            del generated
         except RuntimeError as e:
-            if 'out of memory' in str(e).lower():
+            err_str = str(e).lower()
+            if 'out of memory' in err_str or 'npu' in err_str and ('memory' in err_str or 'alloc' in err_str or '507048' in str(e)):
                 if device.type == "npu":
                     torch.npu.empty_cache()
                 elif device.type == "cuda":
                     torch.cuda.empty_cache()
+                gc.collect()
                 correct[idx] = 0.0
+                print0(f"  [{label}] OOM at example {idx}, skipping")
                 continue
             raise
 
@@ -480,9 +490,23 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
         is_correct = compare_answers(pred_answer, gold_answer, answer_extractor)
         correct[idx] = float(is_correct)
 
+        del prompt_tokens, generated_text, pred_answer
+        if count % 10 == 0:
+            gc.collect()
+            if device.type == "npu":
+                torch.npu.empty_cache()
+            elif device.type == "cuda":
+                torch.cuda.empty_cache()
+
         if count % 50 == 0 and count > 0:
             partial_acc = correct[:idx+1].mean().item()
             print0(f"  [{label}] {count}/{len(my_indices)} examples, partial acc: {partial_acc:.4f}")
+
+    if device.type == "npu":
+        torch.npu.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
 
     if world_size > 1:
         dist.barrier()
