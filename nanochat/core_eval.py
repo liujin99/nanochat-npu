@@ -407,12 +407,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
 
 
 @torch.no_grad()
-def evaluate_generation_task(model, tokenizer, data, device, task_meta):
-    """
-    Evaluate a generation task (GSM8K, MATH, etc.) using autoregressive generation.
-    Renders few-shot ICL prompt, generates completion, extracts answer, compares with gold.
-    Truncates prompt (by dropping few-shot examples) if it exceeds max_seq_len - max_gen_tokens.
-    """
+def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batch_size=8):
     import gc
     from nanochat.engine import Engine
 
@@ -440,21 +435,19 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
     elif device.type == "cuda":
         torch.cuda.empty_cache()
 
-    for count, idx in enumerate(my_indices):
+    prepared = []
+    for idx in my_indices:
         item = data[idx]
-
         gold_answer = extract_answer(item['answer'], answer_extractor)
         if 'gold_answer' in item and item['gold_answer']:
             gold_answer = item['gold_answer']
 
-        effective_fewshot = num_fewshot
         fewshot_examples = []
-        if effective_fewshot > 0:
+        if num_fewshot > 0:
             rng = random.Random(1234 + idx)
             available_indices = [i for i in range(len(data)) if i != idx]
-            fewshot_indices = rng.sample(available_indices, min(effective_fewshot, len(available_indices)))
+            fewshot_indices = rng.sample(available_indices, min(num_fewshot, len(available_indices)))
             fewshot_examples = [data[i] for i in fewshot_indices]
-
             if max_prompt_len is not None:
                 while fewshot_examples:
                     prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
@@ -465,16 +458,24 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
 
         prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
         prompt_tokens = tokenizer(prompt, prepend=bos_token_id)
-
         if max_prompt_len and len(prompt_tokens) > max_prompt_len:
             prompt_tokens = prompt_tokens[:max_prompt_len]
 
+        prepared.append((idx, prompt_tokens, gold_answer))
+
+    current_batch_size = gen_batch_size
+    batch_start = 0
+    while batch_start < len(prepared):
+        batch_end = min(batch_start + current_batch_size, len(prepared))
+        batch = prepared[batch_start:batch_end]
+        batch_prompts = [p[1] for p in batch]
+        batch_indices = [p[0] for p in batch]
+        batch_golds = [p[2] for p in batch]
+
         try:
-            generated, _ = engine.generate_batch(
-                prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
+            results, _ = engine.generate_batch_prompts(
+                batch_prompts, max_tokens=max_gen_tokens, temperature=0
             )
-            generated_text = tokenizer.decode(generated[0][len(prompt_tokens):])
-            del generated
         except RuntimeError as e:
             err_str = str(e).lower()
             if 'out of memory' in err_str or ('npu' in err_str and ('memory' in err_str or 'alloc' in err_str or '507048' in str(e))):
@@ -483,27 +484,45 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
                 elif device.type == "cuda":
                     torch.cuda.empty_cache()
                 gc.collect()
-                correct[idx] = 0.0
                 oom_flag[0] = 1.0
-                print0(f"  [{label}] OOM at example {idx}, skipping")
+                if current_batch_size > 1:
+                    current_batch_size = max(1, current_batch_size // 2)
+                    continue
+                for idx, prompt_tokens, gold in batch:
+                    try:
+                        generated, _ = engine.generate_batch(
+                            prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
+                        )
+                        generated_text = tokenizer.decode(generated[0][len(prompt_tokens):])
+                        pred_answer = extract_answer(generated_text, answer_extractor)
+                        is_correct = compare_answers(pred_answer, gold, answer_extractor)
+                        correct[idx] = float(is_correct)
+                    except RuntimeError:
+                        correct[idx] = 0.0
+                        print0(f"  [{label}] OOM at example {idx}, skipping")
+                batch_start += len(batch)
                 continue
             raise
 
-        pred_answer = extract_answer(generated_text, answer_extractor)
-        is_correct = compare_answers(pred_answer, gold_answer, answer_extractor)
-        correct[idx] = float(is_correct)
+        for i, (idx, gold) in enumerate(zip(batch_indices, batch_golds)):
+            generated_text = tokenizer.decode(results[i][len(batch_prompts[i]):])
+            pred_answer = extract_answer(generated_text, answer_extractor)
+            is_correct = compare_answers(pred_answer, gold, answer_extractor)
+            correct[idx] = float(is_correct)
 
-        del prompt_tokens, generated_text, pred_answer
-        if count % 10 == 0:
-            gc.collect()
-            if device.type == "npu":
-                torch.npu.empty_cache()
-            elif device.type == "cuda":
-                torch.cuda.empty_cache()
+        del results
+        gc.collect()
+        if device.type == "npu":
+            torch.npu.empty_cache()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
 
-        if count % 50 == 0 and count > 0:
-            partial_acc = correct[:idx+1].mean().item()
+        if batch_start > 0 and (batch_start // gen_batch_size) % 10 == 0:
+            count = batch_start
+            partial_acc = correct[:batch_end].mean().item()
             print0(f"  [{label}] {count}/{len(my_indices)} examples, partial acc: {partial_acc:.4f}")
+
+        batch_start = batch_end
 
     if device.type == "npu":
         torch.npu.empty_cache()
@@ -515,8 +534,8 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta):
         dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
         any_oom = oom_flag[0].item() > 0.5
         if any_oom:
-            print0(f"  [{label}] OOM detected on one or more ranks, skipping all_reduce for accuracy (returning partial per-rank result)")
-            return correct[:len(my_indices)].mean().item()
+            print0(f"  [{label}] OOM detected, returning partial result")
+            return correct.mean().item()
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     return correct.mean().item()

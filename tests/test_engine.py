@@ -4,6 +4,9 @@ Test Engine class. Example run:
 python -m pytest tests/test_engine.py -v
 """
 
+import os
+os.environ["NANOCHAT_DTYPE"] = "float32"
+
 import torch
 from nanochat.engine import KVCache, Engine
 from dataclasses import dataclass
@@ -265,3 +268,100 @@ def test_different_seeds_introduce_variation_when_temperature_nonzero():
 
     # Sanity check: sampling actually introduces variation
     assert len(outputs) > 1, "All seeds produced the same output which is statistically highly improbable."
+
+
+def test_kv_cache_merge_from_list():
+    num_heads = 4
+    head_dim = 16
+    num_layers = 2
+    seq_len = 64
+
+    caches = []
+    positions = [5, 10, 3]
+    for pos in positions:
+        cache = KVCache(
+            batch_size=1, num_heads=num_heads, seq_len=seq_len,
+            head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
+        )
+        cache.k_cache[:, 0, :pos, :, :] = torch.randn(num_layers, pos, num_heads, head_dim)
+        cache.v_cache[:, 0, :pos, :, :] = torch.randn(num_layers, pos, num_heads, head_dim)
+        cache.advance(pos)
+        caches.append(cache)
+
+    batch_cache = KVCache(
+        batch_size=3, num_heads=num_heads, seq_len=seq_len,
+        head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
+    )
+    batch_cache.merge_from_list(caches)
+
+    assert batch_cache.has_per_row_positions() == True
+    for i, pos in enumerate(positions):
+        assert batch_cache.cache_seqlens[i].item() == pos
+        assert torch.allclose(batch_cache.k_cache[:, i, :pos, :, :], caches[i].k_cache[:, 0, :pos, :, :])
+        assert torch.allclose(batch_cache.v_cache[:, i, :pos, :, :], caches[i].v_cache[:, 0, :pos, :, :])
+
+
+def test_kv_cache_has_per_row_positions():
+    cache = KVCache(
+        batch_size=4, num_heads=4, seq_len=64,
+        head_dim=16, num_layers=2, device="cpu", dtype=torch.float32,
+    )
+    cache.cache_seqlens.fill_(10)
+    assert cache.has_per_row_positions() == False
+
+    cache.cache_seqlens[0] = 5
+    assert cache.has_per_row_positions() == True
+
+    cache_single = KVCache(
+        batch_size=1, num_heads=4, seq_len=64,
+        head_dim=16, num_layers=2, device="cpu", dtype=torch.float32,
+    )
+    assert cache_single.has_per_row_positions() == False
+
+
+def test_batch_prompts_matches_serial():
+    import nanochat.flash_attention as fa
+    original_impl = fa._override_impl
+    fa._override_impl = 'sdpa'
+
+    try:
+        from nanochat.gpt import GPT, GPTConfig
+
+        config = GPTConfig(
+            sequence_len=64,
+            vocab_size=262,
+            n_layer=2,
+            n_head=4,
+            n_kv_head=4,
+            n_embd=64,
+            window_pattern="L",
+        )
+        model = GPT(config)
+        model.init_weights()
+
+        tokenizer = ByteTokenizer()
+        engine = Engine(model, tokenizer)
+
+        prompts = [
+            [261, 1, 2, 3],
+            [261, 10, 20, 30, 40, 50],
+            [261, 100],
+        ]
+
+        serial_results = []
+        for prompt in prompts:
+            result, _ = engine.generate_batch(
+                prompt, num_samples=1, max_tokens=10, temperature=0
+            )
+            serial_results.append(result[0])
+
+        batch_results, _ = engine.generate_batch_prompts(
+            prompts, max_tokens=10, temperature=0
+        )
+
+        for i in range(len(prompts)):
+            assert serial_results[i] == batch_results[i], (
+                f"Prompt {i}: serial={serial_results[i]}, batch={batch_results[i]}"
+            )
+    finally:
+        fa._override_impl = original_impl

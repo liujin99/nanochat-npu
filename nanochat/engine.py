@@ -132,6 +132,31 @@ class KVCache:
         self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
         self.cache_seqlens.fill_(other_pos)
 
+    def merge_from_list(self, cache_list):
+        """
+        Merge a list of batch=1 KV caches into this batch=B cache.
+        Sets per-row cache_seqlens and copies KV data + prev_embedding.
+        """
+        B = len(cache_list)
+        assert self.batch_size == B
+        assert self.get_pos() == 0
+        assert self.n_layers == cache_list[0].n_layers
+        assert self.n_heads == cache_list[0].n_heads
+        assert self.head_dim == cache_list[0].head_dim
+        for i, cache in enumerate(cache_list):
+            pos_i = cache.get_pos()
+            self.k_cache[:, i, :pos_i, :, :] = cache.k_cache[:, 0, :pos_i, :, :]
+            self.v_cache[:, i, :pos_i, :, :] = cache.v_cache[:, 0, :pos_i, :, :]
+            self.cache_seqlens[i] = pos_i
+        prev_embeddings = [c.prev_embedding for c in cache_list]
+        if all(pe is not None for pe in prev_embeddings):
+            self.prev_embedding = torch.cat(prev_embeddings, dim=0)
+
+    def has_per_row_positions(self):
+        if self.cache_seqlens.numel() <= 1:
+            return False
+        return not (self.cache_seqlens == self.cache_seqlens[0]).all().item()
+
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -311,6 +336,105 @@ class Engine:
             # Stop if all rows are completed
             if all(completed):
                 break
+        return results, masks
+
+    @torch.inference_mode()
+    def generate_batch_prompts(self, prompts, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """
+        Batch generation for multiple different prompts.
+        Prefills each prompt serially, merges KV caches, then decodes in parallel.
+        Returns (results, masks) where results[i] is the full token sequence for prompt i.
+        """
+        assert isinstance(prompts, list) and all(isinstance(p, list) for p in prompts)
+        B = len(prompts)
+        if B == 0:
+            return [], []
+        device = self.model.get_device()
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        get_special = lambda s: self.tokenizer.encode_special(s)
+        assistant_end = get_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        python_start = get_special("<|python_start|>")
+        python_end = get_special("<|python_end|>")
+        output_start = get_special("<|output_start|>")
+        output_end = get_special("<|output_end|>")
+
+        m = self.model.config
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+
+        single_caches = []
+        first_logits_list = []
+        for prompt_tokens in prompts:
+            cache = KVCache(
+                batch_size=1, seq_len=m.sequence_len,
+                device=device, dtype=COMPUTE_DTYPE, **kv_model_kwargs,
+            )
+            ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
+            logits = self.model.forward(ids, kv_cache=cache)
+            logits = logits[:, -1, :]
+            single_caches.append(cache)
+            first_logits_list.append(logits)
+
+        batch_cache = KVCache(
+            batch_size=B, seq_len=m.sequence_len,
+            device=device, dtype=COMPUTE_DTYPE, **kv_model_kwargs,
+        )
+        batch_cache.merge_from_list(single_caches)
+        logits = torch.cat(first_logits_list, dim=0)
+        del single_caches, first_logits_list
+
+        row_states = [RowState(p.copy()) for p in prompts]
+        results = [p.copy() for p in prompts]
+        masks = [[0] * len(p) for p in prompts]
+        completed = [False] * B
+        num_generated = 0
+
+        while True:
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            if all(completed):
+                break
+
+            next_ids = sample_next_token(logits, rng, temperature, top_k)
+            sampled_tokens = next_ids[:, 0].tolist()
+
+            token_column = []
+            for i, state in enumerate(row_states):
+                is_forced = len(state.forced_tokens) > 0
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                token_column.append(next_token)
+                state.current_tokens.append(next_token)
+                if next_token == assistant_end or next_token == bos:
+                    state.completed = True
+                if not completed[i]:
+                    if next_token == assistant_end or next_token == bos:
+                        completed[i] = True
+                    else:
+                        results[i].append(next_token)
+                        masks[i].append(0 if is_forced else 1)
+                if next_token == python_start:
+                    state.in_python_block = True
+                    state.python_expr_tokens = []
+                elif next_token == python_end and state.in_python_block:
+                    state.in_python_block = False
+                    if state.python_expr_tokens:
+                        expr = self.tokenizer.decode(state.python_expr_tokens)
+                        calc_result = use_calculator(expr)
+                        if calc_result is not None:
+                            result_tokens = self.tokenizer.encode(str(calc_result))
+                            state.forced_tokens.append(output_start)
+                            state.forced_tokens.extend(result_tokens)
+                            state.forced_tokens.append(output_end)
+                    state.python_expr_tokens = []
+                elif state.in_python_block:
+                    state.python_expr_tokens.append(next_token)
+
+            num_generated += 1
+            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+            logits = self.model.forward(ids, kv_cache=batch_cache)[:, -1, :]
+
         return results, masks
 
 

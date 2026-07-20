@@ -1,7 +1,9 @@
-"需重新审视修改的必要性"
 import torch
 import torch.nn.functional as F
-import torch_npu
+try:
+    import torch_npu
+except ImportError:
+    pass
 from torch.distributed import is_initialized, barrier
 
 
@@ -39,7 +41,7 @@ def _use_ascend_fa():
 # =============================================================================
 # 核心：昇腾FA实现（训练/推理解耦）
 # =============================================================================
-def _ascend_fa_attention(q, k, v, causal=False, window_size=(-1, -1), is_training=True):
+def _ascend_fa_attention(q, k, v, causal=False, window_size=(-1, -1), is_training=True, attn_mask_override=None):
     if not q.is_npu:
         q, k, v = q.npu(), k.npu(), v.npu()
     device = q.device
@@ -65,41 +67,33 @@ def _ascend_fa_attention(q, k, v, causal=False, window_size=(-1, -1), is_trainin
         return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
 
     # ==========================
-    # 推理
-    # ==========================
-    mask = None
-    if causal:
-        # 情况1：常规因果 mask（Tq==Tk）
-        if Tq == Tk:
-            row_idx = torch.arange(Tq, device=device).unsqueeze(1)
-            col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-            mask = col_idx <= row_idx
-
-        # 情况2：生成 1 个 token
-        elif Tq == 1:
-            mask = torch.ones((1, Tk), device=device, dtype=torch.bool)
-
-        # 情况3：其他长度（极少用）
-        else:
-            base_row = (Tk - Tq) + torch.arange(Tq, device=device)
-            row_idx = base_row.unsqueeze(1)
-            col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-            mask = col_idx <= row_idx
-
-        # 窗口注意力限制
-        if window_left >= 0:
-            if Tq == 1:
-                keep_start = max(0, Tk - window_left)
-                mask = mask.clone()
-                mask[:, :keep_start] = False
-            else:
+    if attn_mask_override is not None:
+        mask = attn_mask_override
+    else:
+        mask = None
+        if causal:
+            if Tq == Tk:
                 row_idx = torch.arange(Tq, device=device).unsqueeze(1)
                 col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-                mask = mask & ((row_idx - col_idx) <= window_left)
-
-    # mask 转成 -inf
-    if mask is not None:
-        mask = torch.where(mask, 0.0, -1e9).to(dtype=dtype)
+                mask = col_idx <= row_idx
+            elif Tq == 1:
+                mask = torch.ones((1, Tk), device=device, dtype=torch.bool)
+            else:
+                base_row = (Tk - Tq) + torch.arange(Tq, device=device)
+                row_idx = base_row.unsqueeze(1)
+                col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+                mask = col_idx <= row_idx
+            if window_left >= 0:
+                if Tq == 1:
+                    keep_start = max(0, Tk - window_left)
+                    mask = mask.clone()
+                    mask[:, :keep_start] = False
+                else:
+                    row_idx = torch.arange(Tq, device=device).unsqueeze(1)
+                    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+                    mask = mask & ((row_idx - col_idx) <= window_left)
+        if mask is not None:
+            mask = torch.where(mask, 0.0, -1e9).to(dtype=dtype)
 
     sdpa_kwargs = {
         "attn_mask": mask,
@@ -115,7 +109,10 @@ def _ascend_fa_attention(q, k, v, causal=False, window_size=(-1, -1), is_trainin
 # =============================================================================
 # 官方SDPA逻辑：完全复用，不修改
 # =============================================================================
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
+def _sdpa_attention(q, k, v, window_size, enable_gqa, attn_mask_override=None):
+    if attn_mask_override is not None:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_override, is_causal=False, enable_gqa=enable_gqa)
+
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
@@ -175,9 +172,44 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                             causal=False, window_size=(-1, -1)):
-    """
-    推理用Flash Attention（昇腾专用版）
-    """
+    B, T_new, H, D = q.shape
+    per_row = (cache_seqlens is not None and cache_seqlens.numel() > 1
+               and not (cache_seqlens == cache_seqlens[0]).all().item())
+
+    if per_row:
+        seqlens = cache_seqlens.to(torch.int64).to(q.device)
+        if k is not None and v is not None:
+            for i in range(B):
+                pos_i = seqlens[i].item()
+                k_cache[i, pos_i:pos_i+T_new, :, :] = k[i]
+                v_cache[i, pos_i:pos_i+T_new, :, :] = v[i]
+        max_seqlen = seqlens.max().item()
+        end_pos = max_seqlen + T_new
+        k_full = k_cache[:, :end_pos, :, :].contiguous()
+        v_full = v_cache[:, :end_pos, :, :].contiguous()
+        Tk = end_pos
+        col_idx = torch.arange(Tk, device=q.device, dtype=torch.int64)
+        row_seqlens = seqlens.unsqueeze(1)
+        col_broadcast = col_idx.unsqueeze(0)
+        mask_bool = col_broadcast <= row_seqlens
+        window_left = window_size[0]
+        if window_left >= 0:
+            keep_start = torch.clamp(row_seqlens - window_left, min=0)
+            mask_bool = mask_bool & (col_broadcast >= keep_start)
+        mask_4d = mask_bool.unsqueeze(1).unsqueeze(2)
+        attn_mask = torch.where(mask_4d, 0.0, -1e9).to(dtype=q.dtype)
+        q_sdpa = q.transpose(1, 2).contiguous()
+        k_sdpa = k_full.transpose(1, 2).contiguous()
+        v_sdpa = v_full.transpose(1, 2).contiguous()
+        if _use_ascend_fa():
+            y_sdpa = _ascend_fa_attention(q_sdpa, k_sdpa, v_sdpa, causal, window_size,
+                                          is_training=False, attn_mask_override=attn_mask)
+        else:
+            enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
+            y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa,
+                                     attn_mask_override=attn_mask)
+        return y_sdpa.transpose(1, 2).contiguous()
+
     if _use_ascend_fa():
         B, T_new, H, D = q.shape
         if cache_seqlens is not None:
