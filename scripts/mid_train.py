@@ -82,6 +82,7 @@ parser.add_argument("--eval-tokens", type=int, default=20 * 524288, help="number
 parser.add_argument("--core-metric-every", type=int, default=500,
                     help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
+parser.add_argument("--eval-benchmarks", type=str, default=None, help="benchmarks to evaluate: all, core, stem, or comma-separated labels (e.g. mmlu_fewshot,gsm8k_cot). Default: all")
 parser.add_argument("--sample-every", type=int, default=500, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 default_mid_train_data = os.path.join(get_base_dir(), "mid_train_data")
@@ -292,9 +293,21 @@ while True:
 
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({"step": step, "core_metric": results["core_metric"]})
+        benchmarks_arg = args.eval_benchmarks
+        if benchmarks_arg is not None and benchmarks_arg not in ('all', 'core', 'stem'):
+            benchmarks_arg = [b.strip() for b in benchmarks_arg.split(',')]
+        results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task, benchmarks=benchmarks_arg)
+        if results['core_metric'] is not None:
+            print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        if results['stem_metric'] is not None:
+            print0(f"Step {step:05d} | STEM metric: {results['stem_metric']:.4f}")
+        log_data = {"step": step, "total_training_flops": flops_so_far}
+        if results['core_metric'] is not None:
+            log_data["core_metric"] = results["core_metric"]
+        if results['stem_metric'] is not None:
+            log_data["stem_metric"] = results["stem_metric"]
+        log_data["centered_results"] = results["centered_results"]
+        wandb_run.log(log_data)
         model.train()
 
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
