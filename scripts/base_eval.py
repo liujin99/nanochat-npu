@@ -121,7 +121,7 @@ STEM_TASKS = [
     {
         'label': 'gsm8k_cot',
         'dataset_uri': 'gsm8k.jsonl',
-        'num_fewshot': [8],
+        'num_fewshot': [5],
         'icl_task_type': 'generation',
         'continuation_delimiter': '\nAnswer: ',
         'answer_extractor': 'gsm8k',
@@ -130,7 +130,7 @@ STEM_TASKS = [
     {
         'label': 'math_cot',
         'dataset_uri': 'math500.jsonl',
-        'num_fewshot': [4],
+        'num_fewshot': [5],
         'icl_task_type': 'generation',
         'continuation_delimiter': '\n\nSolution: ',
         'answer_extractor': 'math',
