@@ -160,6 +160,7 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.max_seq_len = config.sequence_len
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)

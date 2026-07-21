@@ -478,31 +478,31 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
             )
         except RuntimeError as e:
             err_str = str(e).lower()
-            if 'out of memory' in err_str or ('npu' in err_str and ('memory' in err_str or 'alloc' in err_str or '507048' in str(e))):
-                if device.type == "npu":
-                    torch.npu.empty_cache()
-                elif device.type == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
-                oom_flag[0] = 1.0
-                if current_batch_size > 1:
-                    current_batch_size = max(1, current_batch_size // 2)
-                    continue
-                for idx, prompt_tokens, gold in batch:
-                    try:
-                        generated, _ = engine.generate_batch(
-                            prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
-                        )
-                        generated_text = tokenizer.decode(generated[0][len(prompt_tokens):])
-                        pred_answer = extract_answer(generated_text, answer_extractor)
-                        is_correct = compare_answers(pred_answer, gold, answer_extractor)
-                        correct[idx] = float(is_correct)
-                    except RuntimeError:
-                        correct[idx] = 0.0
-                        print0(f"  [{label}] OOM at example {idx}, skipping")
-                batch_start += len(batch)
+            is_oom = 'out of memory' in err_str or ('npu' in err_str and ('memory' in err_str or 'alloc' in err_str or '507048' in str(e)))
+            if device.type == "npu":
+                torch.npu.empty_cache()
+            elif device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+            oom_flag[0] = 1.0
+            print0(f"  [{label}] RuntimeError at batch {batch_start}: {str(e)[:200]}")
+            if is_oom and current_batch_size > 1:
+                current_batch_size = max(1, current_batch_size // 2)
                 continue
-            raise
+            for idx, prompt_tokens, gold in batch:
+                try:
+                    generated, _ = engine.generate_batch(
+                        prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
+                    )
+                    generated_text = tokenizer.decode(generated[0][len(prompt_tokens):])
+                    pred_answer = extract_answer(generated_text, answer_extractor)
+                    is_correct = compare_answers(pred_answer, gold, answer_extractor)
+                    correct[idx] = float(is_correct)
+                except RuntimeError:
+                    correct[idx] = 0.0
+                    print0(f"  [{label}] Error at example {idx}, skipping")
+            batch_start += len(batch)
+            continue
 
         for i, (idx, gold) in enumerate(zip(batch_indices, batch_golds)):
             generated_text = tokenizer.decode(results[i][len(batch_prompts[i]):])
@@ -531,11 +531,15 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
     gc.collect()
 
     if world_size > 1:
-        dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
-        any_oom = oom_flag[0].item() > 0.5
-        if any_oom:
-            print0(f"  [{label}] OOM detected, returning partial result")
+        try:
+            dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+            any_oom = oom_flag[0].item() > 0.5
+            if any_oom:
+                print0(f"  [{label}] OOM detected, returning partial result")
+                return correct.mean().item()
+            dist.barrier()
+            dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        except RuntimeError as e:
+            print0(f"  [{label}] Collective communication failed: {str(e)[:200]}, returning local result")
             return correct.mean().item()
-        dist.barrier()
-        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     return correct.mean().item()
