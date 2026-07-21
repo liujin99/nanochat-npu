@@ -227,13 +227,27 @@ class Engine:
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
 
         if num_samples == 1:
-            # Reuse persistent KVCache: reset, prefill, decode all in same cache.
-            # No malloc/free → no NPU memory fragmentation from 150+ alloc/free cycles.
-            self._kv_cache.reset()
-            ids = torch.tensor([tokens], dtype=torch.long, device=device)
-            logits = self.model.forward(ids, kv_cache=self._kv_cache)
-            logits = logits[:, -1, :]  # (1, vocab_size)
-            kv_cache_decode = self._kv_cache
+            if len(tokens) > self._kv_cache.max_seq_len:
+                # Fallback: prompt exceeds persistent cache seq_len (e.g. GSM8K 8-shot ~2059 > 2048).
+                # Create temporary KVCache sized to fit the full prompt, preserving result accuracy.
+                kv_cache_decode = KVCache(
+                    batch_size=1,
+                    seq_len=len(tokens),
+                    device=device,
+                    dtype=dtype,
+                    **kv_model_kwargs,
+                )
+                ids = torch.tensor([tokens], dtype=torch.long, device=device)
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode)
+                logits = logits[:, -1, :]
+            else:
+                # Reuse persistent KVCache: reset, prefill, decode all in same cache.
+                # No malloc/free → no NPU memory fragmentation.
+                self._kv_cache.reset()
+                ids = torch.tensor([tokens], dtype=torch.long, device=device)
+                logits = self.model.forward(ids, kv_cache=self._kv_cache)
+                logits = logits[:, -1, :]
+                kv_cache_decode = self._kv_cache
         else:
             # Two-stage: prefill batch=1, then copy to batch=num_samples decode cache
             kv_cache_prefill = KVCache(
@@ -364,11 +378,14 @@ class Engine:
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
 
+        max_prompt_len = max(len(p) for p in prompts)
+        cache_seq_len = max(max_prompt_len, m.sequence_len)
+
         single_caches = []
         first_logits_list = []
         for prompt_tokens in prompts:
             cache = KVCache(
-                batch_size=1, seq_len=m.sequence_len,
+                batch_size=1, seq_len=cache_seq_len,
                 device=device, dtype=COMPUTE_DTYPE, **kv_model_kwargs,
             )
             ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
@@ -378,7 +395,7 @@ class Engine:
             first_logits_list.append(logits)
 
         batch_cache = KVCache(
-            batch_size=B, seq_len=m.sequence_len,
+            batch_size=B, seq_len=cache_seq_len,
             device=device, dtype=COMPUTE_DTYPE, **kv_model_kwargs,
         )
         batch_cache.merge_from_list(single_caches)
