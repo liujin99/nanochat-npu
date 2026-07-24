@@ -171,7 +171,7 @@ def place_eval_stem(file_path):
 
 def prepare_stem_eval_data():
     """Download pre-packaged STEM evaluation data zip and extract.
-    Uses huggingface_hub for proper Git LFS handling.
+    Uses requests with SSL verification disabled (corporate proxy compatible).
     """
     base_dir = get_base_dir()
     eval_stem_dir = os.path.join(base_dir, "eval_stem")
@@ -183,17 +183,19 @@ def prepare_stem_eval_data():
         print0(f"WARNING: {eval_stem_dir} exists but contains no eval data, will re-download...")
 
     print0("Downloading STEM evaluation data package...")
-    from huggingface_hub import hf_hub_download
+    import requests
+    import urllib3
+    urllib3.disable_warnings()
+    STEM_EVAL_URL = "https://huggingface.co/datasets/liujin99/nanochat-npu-stem-eval/resolve/main/eval_stem.zip"
     file_path = os.path.join(base_dir, "eval_stem.zip")
     lock_path = file_path + ".lock"
     with FileLock(lock_path):
         if not os.path.exists(file_path) or not zipfile.is_zipfile(file_path):
-            cached_path = hf_hub_download(
-                repo_id="liujin99/nanochat-npu-stem-eval",
-                filename="eval_stem.zip",
-                repo_type="dataset",
-            )
-            shutil.copy2(cached_path, file_path)
+            response = requests.get(STEM_EVAL_URL, stream=True, verify=False, allow_redirects=True)
+            response.raise_for_status()
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
             print0(f"Downloaded to {file_path}")
         place_eval_stem(file_path)
 
