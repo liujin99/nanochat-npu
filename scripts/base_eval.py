@@ -227,6 +227,35 @@ def place_eval_bundle(file_path):
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
+def prepare_eval_data(benchmarks='all'):
+    """Download all eval data needed for the given benchmarks.
+
+    Call this before training to fail fast on download issues.
+    Adding new benchmark types only requires modifying this function.
+
+    benchmarks: 'all'/'core'/'stem' (str), None (= all), or list of labels.
+    """
+    base_dir = get_base_dir()
+
+    if isinstance(benchmarks, str) and benchmarks not in ('all', 'core', 'stem'):
+        benchmarks = [b.strip() for b in benchmarks.split(',')]
+
+    eval_bundle_dir = os.path.join(base_dir, 'eval_bundle')
+    if not os.path.exists(eval_bundle_dir):
+        download_file_with_lock(EVAL_BUNDLE_URL, 'eval_bundle.zip', postprocess_fn=place_eval_bundle)
+        print0('  ✓ eval_bundle downloaded')
+    else:
+        print0('  ✓ eval_bundle already exists')
+
+    need_stem = benchmarks is None or benchmarks in ('all', 'stem') or \
+        (isinstance(benchmarks, list) and any(t['label'] in benchmarks for t in STEM_TASKS))
+    if need_stem:
+        prepare_stem_eval_data()
+        print0('  ✓ eval_stem ready')
+
+    print0('  All eval data ready')
+
+
 def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_size=1, benchmarks=None):
     """
     Evaluate a base model on selected benchmarks.
@@ -241,9 +270,8 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
     """
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
-    # Download the eval bundle if needed
-    if not os.path.exists(eval_bundle_dir):
-        download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
+
+    prepare_eval_data(benchmarks)
 
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -255,7 +283,8 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
     need_stem = benchmarks is None or benchmarks == 'all' or benchmarks == 'stem' or \
         (benchmarks and any(t['label'] in benchmarks for t in STEM_TASKS))
     if need_stem:
-        eval_stem_dir, available_stem_labels = prepare_stem_eval_data()
+        eval_stem_dir = os.path.join(base_dir, "eval_stem")
+        available_stem_labels = get_available_stem_tasks(os.path.join(eval_stem_dir, "eval_data"))
         stem_tasks = [t for t in STEM_TASKS if t['label'] in available_stem_labels]
     else:
         stem_tasks = []
