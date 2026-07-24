@@ -9,8 +9,8 @@ export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export OMP_NUM_THREADS=1
 mkdir -p $NANOCHAT_BASE_DIR
 
-# HuggingFace镜像源（国内环境加速下载）
-export HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
+# HuggingFace endpoint (use official endpoint, set HF_ENDPOINT env var to override)
+export HF_ENDPOINT=${HF_ENDPOINT:-"https://huggingface.co"}
 
 
 # 自动获取脚本所在目录的上一级（项目根）

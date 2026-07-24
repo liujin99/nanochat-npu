@@ -93,47 +93,47 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     """
     Downloads a file from a URL to a local path in the base directory.
     Uses a lock file to prevent concurrent downloads among multiple ranks.
+    All ranks enter the lock; the first to arrive downloads, subsequent ranks
+    find the file already present but still call postprocess_fn (idempotent).
     """
     base_dir = get_base_dir()
     file_path = os.path.join(base_dir, filename)
     lock_path = file_path + ".lock"
 
-    if os.path.exists(file_path):
-        return file_path
-
     with FileLock(lock_path):
-        # Only a single rank can acquire this lock
-        # All other ranks block until it is released
+        if not os.path.exists(file_path):
+            # Download the content as bytes with retry
+            import time
+            max_retries = 5
+            for attempt in range(1, max_retries + 1):
+                try:
+                    print(f"Downloading {url}... (attempt {attempt})")
+                    with urllib.request.urlopen(url) as response:
+                        content = response.read()
+                    break
+                except Exception as e:
+                    if attempt < max_retries:
+                        wait = 5 * attempt
+                        print(f"Download failed: {e}, retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        raise RuntimeError(f"Failed to download {url} after {max_retries} attempts: {e}") from e
 
-        # Recheck after acquiring lock
-        if os.path.exists(file_path):
-            return file_path
+            # Write to local file
+            with open(file_path, 'wb') as f:
+                f.write(content)
+            print(f"Downloaded to {file_path}")
 
-        # Download the content as bytes with retry
-        import time
-        max_retries = 5
-        for attempt in range(1, max_retries + 1):
-            try:
-                print(f"Downloading {url}... (attempt {attempt})")
-                with urllib.request.urlopen(url) as response:
-                    content = response.read()
-                break
-            except Exception as e:
-                if attempt < max_retries:
-                    wait = 5 * attempt
-                    print(f"Download failed: {e}, retrying in {wait}s...")
-                    time.sleep(wait)
-                else:
-                    raise RuntimeError(f"Failed to download {url} after {max_retries} attempts: {e}") from e
-
-        # Write to local file
-        with open(file_path, 'wb') as f:
-            f.write(content)
-        print(f"Downloaded to {file_path}")
-
-        # Run the postprocess function if provided
+        # Run the postprocess function if provided (e.g., extraction)
+        # Called by every rank; must be idempotent
         if postprocess_fn is not None:
-            postprocess_fn(file_path)
+            try:
+                postprocess_fn(file_path)
+            except Exception:
+                # Clean up corrupted file so future retries can re-download
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                raise
 
     return file_path
 

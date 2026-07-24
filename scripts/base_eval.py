@@ -39,6 +39,7 @@ import ssl
 import urllib
 ssl._create_default_https_context = ssl._create_unverified_context
 
+from filelock import FileLock
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
 from nanochat.checkpoint_manager import load_model
@@ -98,7 +99,6 @@ def get_hf_token_bytes(tokenizer, device="cpu"):
 # CORE evaluation
 
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
-EVAL_STEM_URL = "https://hf-mirror.com/datasets/liujin99/nanochat-npu-stem-eval/resolve/main/eval_stem.zip"
 
 STEM_SUBJECT_KEYWORDS = [
     'abstract_algebra', 'anatomy', 'astronomy', 'college_biology', 'college_chemistry',
@@ -159,6 +159,8 @@ def place_eval_stem(file_path):
     """Unzip eval_stem.zip and place it in the base directory."""
     base_dir = get_base_dir()
     eval_stem_dir = os.path.join(base_dir, "eval_stem")
+    if os.path.exists(eval_stem_dir):
+        return
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
             zip_ref.extractall(tmpdir)
@@ -169,7 +171,7 @@ def place_eval_stem(file_path):
 
 def prepare_stem_eval_data():
     """Download pre-packaged STEM evaluation data zip and extract.
-    Raises RuntimeError if download fails, consistent with CORE eval bundle behavior.
+    Uses huggingface_hub for proper Git LFS handling.
     """
     base_dir = get_base_dir()
     eval_stem_dir = os.path.join(base_dir, "eval_stem")
@@ -181,7 +183,20 @@ def prepare_stem_eval_data():
         print0(f"WARNING: {eval_stem_dir} exists but contains no eval data, will re-download...")
 
     print0("Downloading STEM evaluation data package...")
-    download_file_with_lock(EVAL_STEM_URL, "eval_stem.zip", postprocess_fn=place_eval_stem)
+    from huggingface_hub import hf_hub_download
+    file_path = os.path.join(base_dir, "eval_stem.zip")
+    lock_path = file_path + ".lock"
+    with FileLock(lock_path):
+        if not os.path.exists(file_path) or not zipfile.is_zipfile(file_path):
+            cached_path = hf_hub_download(
+                repo_id="liujin99/nanochat-npu-stem-eval",
+                filename="eval_stem.zip",
+                repo_type="dataset",
+            )
+            shutil.copy2(cached_path, file_path)
+            print0(f"Downloaded to {file_path}")
+        place_eval_stem(file_path)
+
     available = get_available_stem_tasks(os.path.join(eval_stem_dir, "eval_data"))
     if not available:
         raise RuntimeError(f"eval_stem.zip downloaded but no task data found at {eval_stem_dir}/eval_data/")
@@ -202,6 +217,8 @@ def place_eval_bundle(file_path):
     """Unzip eval_bundle.zip and place it in the base directory."""
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
+    if os.path.exists(eval_bundle_dir):
+        return
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
             zip_ref.extractall(tmpdir)
