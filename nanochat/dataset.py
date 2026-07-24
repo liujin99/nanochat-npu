@@ -45,7 +45,6 @@ DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
 MID_TRAIN_DATA_DIR = os.path.join(base_dir, "mid_train_data")
 TEMP_DOWNLOAD_DIR = os.path.join(base_dir, "tmp_mid_download")
 MATH_DIR = os.path.join(base_dir, "math_datasets")
-os.makedirs(MATH_DIR, exist_ok=True)
 
 # -----------------------------------------------------------------------------
 # System & HTTP session
