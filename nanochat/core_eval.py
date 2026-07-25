@@ -463,6 +463,8 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
 
         prepared.append((idx, prompt_tokens, gold_answer))
 
+    local_correct = 0.0
+    local_done = 0
     current_batch_size = gen_batch_size
     batch_start = 0
     while batch_start < len(prepared):
@@ -490,6 +492,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
                 current_batch_size = max(1, current_batch_size // 2)
                 continue
             for idx, prompt_tokens, gold in batch:
+                local_done += 1
                 try:
                     generated, _ = engine.generate_batch(
                         prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
@@ -498,6 +501,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
                     pred_answer = extract_answer(generated_text, answer_extractor)
                     is_correct = compare_answers(pred_answer, gold, answer_extractor)
                     correct[idx] = float(is_correct)
+                    local_correct += float(is_correct)
                 except RuntimeError:
                     correct[idx] = 0.0
                     print0(f"  [{label}] Error at example {idx}, skipping")
@@ -509,6 +513,8 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
             pred_answer = extract_answer(generated_text, answer_extractor)
             is_correct = compare_answers(pred_answer, gold, answer_extractor)
             correct[idx] = float(is_correct)
+            local_correct += float(is_correct)
+            local_done += 1
 
         del results
         gc.collect()
@@ -519,7 +525,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
 
         if batch_start > 0 and (batch_start // gen_batch_size) % 10 == 0:
             count = batch_start
-            partial_acc = correct[:batch_end].mean().item()
+            partial_acc = local_correct / local_done if local_done > 0 else 0.0
             print0(f"  [{label}] {count}/{len(my_indices)} examples, partial acc: {partial_acc:.4f}")
 
         batch_start = batch_end
