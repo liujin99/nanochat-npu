@@ -186,7 +186,8 @@ def prepare_stem_eval_data():
     import requests
     import urllib3
     urllib3.disable_warnings()
-    STEM_EVAL_URL = "https://huggingface.co/datasets/liujin99/nanochat-npu-stem-eval/resolve/main/eval_stem.zip"
+    hf_endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co')
+    STEM_EVAL_URL = f"{hf_endpoint}/datasets/liujin99/nanochat-npu-stem-eval/resolve/main/eval_stem.zip"
     file_path = os.path.join(base_dir, "eval_stem.zip")
     lock_path = file_path + ".lock"
     with FileLock(lock_path):
