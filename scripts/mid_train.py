@@ -211,7 +211,7 @@ if args.load_optimizer:
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
         # 预训练LR已含batch_lr_scale；仅当batch_size变化时追加缩放
-        pretrain_batch = pretrain_user_config.get("total_batch_size", total_batch_size)
+        pretrain_batch = meta.get("total_batch_size", total_batch_size)
         batch_ratio = (total_batch_size / pretrain_batch) ** 0.5 if total_batch_size != pretrain_batch else 1.0
         effective_lr_scale = args.lr_scale * batch_ratio
         for group in optimizer.param_groups:
