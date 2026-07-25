@@ -69,12 +69,14 @@ GLOBAL_SESSION = init_global_session()
 def list_parquet_files(data_dir=None, warn_on_legacy=False):
     if data_dir is None:
         data_dir = os.path.join(base_dir, "base_data_climbmix")
-    if not os.path.exists(data_dir):
-        fallback = os.path.join(base_dir, "mid_train_data")
-        if os.path.exists(fallback):
-            data_dir = fallback
-        else:
-            raise ValueError(f"数据目录不存在: {data_dir}")
+        if not os.path.exists(data_dir):
+            fallback = os.path.join(base_dir, "mid_train_data")
+            if os.path.exists(fallback):
+                data_dir = fallback
+            else:
+                raise ValueError(f"数据目录不存在: {data_dir}")
+    elif not os.path.exists(data_dir):
+        raise ValueError(f"数据目录不存在: {data_dir}")
     files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet") and not f.endswith(".tmp")])
     return [os.path.join(data_dir, f) for f in files]
 
