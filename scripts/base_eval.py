@@ -128,7 +128,7 @@ STEM_TASKS = [
         'max_gen_tokens': 256,
     },
     {
-        'label': 'math_cot',
+        'label': 'math_cot_500',
         'dataset_uri': 'math500.jsonl',
         'num_fewshot': [5],
         'icl_task_type': 'generation',
@@ -152,7 +152,7 @@ STEM_TASKS = [
     },
 ]
 
-STEM_BENCHMARK_LABELS = ['arc_easy', 'arc_challenge', 'mmlu_stem', 'gpqa_diamond', 'gsm8k_cot', 'math_cot']
+STEM_BENCHMARK_LABELS = ['arc_easy', 'arc_challenge', 'mmlu_stem', 'gpqa_diamond', 'gsm8k_cot', 'math_cot_500']
 
 
 def place_eval_stem(file_path):

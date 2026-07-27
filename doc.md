@@ -141,8 +141,8 @@ python -m nanochat.dataset -n 30 -d mid_train
 | `arc_challenge` | core.yaml | 多选题 | 10-shot | ARC Challenge 科学推理 |
 | `mmlu_stem` | eval_stem (HF) | 多选题 | 0-shot | MMLU STEM 子集（22学科，3545题） |
 | `gpqa_diamond` | eval_stem (HF) | 多选题 | 0-shot | GPQA Diamond 博士级科学QA（198题） |
-| `gsm8k_cot` | eval_stem (HF) | 生成式 | 8-shot | GSM8K 数学应用题（1319题） |
-| `math_cot` | eval_stem (HF) | 生成式 | 4-shot | MATH-500 数学竞赛（500题） |
+| `gsm8k_cot` | eval_stem (HF) | 生成式 | 5-shot | GSM8K 数学应用题（1319题） |
+| `math_cot_500` | eval_stem (HF) | 生成式 | 5-shot | MATH-500 数学竞赛（500题） |
 
 #### MMLU STEM 子集学科（22个，3545题）
 
@@ -175,7 +175,7 @@ python -m nanochat.dataset -n 30 -d mid_train
 
 **多选题评测**（arc, mmlu_stem, gpqa）：ICL few-shot prompt → 模型前向传播 → 各选项 loss 对比 → 选择最小 loss 选项 → 判断正确性
 
-**生成式评测**（gsm8k_cot, math_cot）：ICL few-shot prompt → 自回归生成 → 正则提取答案 → 与 gold 对比
+**生成式评测**（gsm8k_cot, math_cot_500）：ICL few-shot prompt → 自回归生成 → 正则提取答案 → 与 gold 对比
 
 - GSM8K：提取 `#### N` / `The answer is N` / 最后一个数字
 - MATH：提取 `\boxed{}` / `The answer is`
