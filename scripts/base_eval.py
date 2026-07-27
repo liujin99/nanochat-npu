@@ -268,7 +268,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
     benchmarks controls which tasks to evaluate:
       None or 'all'  : evaluate all (core + stem)
       'core'         : evaluate only DCLM core tasks
-      'stem'         : evaluate only STEM benchmarks (GPQA, GSM8K, MATH_COT, MMLU)
+      'stem'         : evaluate only STEM benchmarks (GPQA, GSM8K, MATH_COT_500, MMLU)
       comma-separated: evaluate specific benchmarks by label (e.g. 'mmlu_fewshot,gsm8k_cot')
     """
     base_dir = get_base_dir()
