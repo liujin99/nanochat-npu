@@ -311,6 +311,7 @@ while True:
         model.train()
 
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+        torch.npu.empty_cache()
         model.eval()
         prompts = ["The capital of France is", "The chemical symbol of gold is",
                    "If yesterday was Friday, then tomorrow will be", "The planets of the solar system are:"]
