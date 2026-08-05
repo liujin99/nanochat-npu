@@ -17,6 +17,7 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 """
 
 import torch
+import numpy as np
 import pyarrow.parquet as pq
 import logging
 
@@ -176,4 +177,90 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
+        yield inputs, targets
+
+
+def tokenizing_distributed_data_loader_with_state_flat(
+    tokenizer, B, T, split,
+    tokenizer_threads=4, tokenizer_batch_size=128,
+    device="cuda", resume_state_dict=None,
+    buffer_size=1000, data_dir=None
+):
+    """
+    Flat concatenation dataloader with zero token waste.
+
+    Documents are tokenized with BOS prepended, then concatenated into a continuous
+    token stream. Batches are formed by slicing the stream into rows of length T+1.
+    No tokens are discarded — long documents simply span multiple rows.
+
+    Key properties:
+    - Zero token waste (no cropping, no padding)
+    - Complete document content preserved (no lost answers/conclusions)
+    - BOS token marks document boundaries (soft boundary, no attention masking)
+    - Same output format as BOS-bestfit: (inputs [B,T], targets [B,T], state_dict)
+
+    Inspired by DeepSeek V3's document packing (Section 4.1): packing for data
+    integrity without cross-sample attention masking.
+    """
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+
+    row_capacity = T + 1
+    needed_tokens = B * row_capacity
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=data_dir)
+    bos_token = tokenizer.get_bos_token_id()
+    token_lists = []
+    current_idx = 0
+    current_offset = 0
+    pq_idx, rg_idx, epoch = 0, 0, 1
+
+    def refill_buffer():
+        nonlocal pq_idx, rg_idx, epoch
+        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
+        tokenized = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        for tokens in tokenized:
+            token_lists.append(np.array(tokens, dtype=np.int64))
+
+    use_cuda = device == "cuda"
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
+
+    flat_buffer = np.empty(needed_tokens, dtype=np.int64)
+
+    while True:
+        pos = 0
+        while pos < needed_tokens:
+            while len(token_lists) - current_idx < buffer_size:
+                refill_buffer()
+
+            arr = token_lists[current_idx]
+            available = len(arr) - current_offset
+            to_copy = min(available, needed_tokens - pos)
+            flat_buffer[pos:pos + to_copy] = arr[current_offset:current_offset + to_copy]
+            pos += to_copy
+            current_offset += to_copy
+            if current_offset >= len(arr):
+                current_idx += 1
+                current_offset = 0
+
+        if current_idx > 1000:
+            del token_lists[:current_idx]
+            current_idx = 0
+
+        row_buffer.copy_(torch.from_numpy(flat_buffer).view(B, row_capacity))
+        cpu_inputs.copy_(row_buffer[:, :-1])
+        cpu_targets.copy_(row_buffer[:, 1:])
+
+        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        yield inputs, targets, state_dict
+
+
+def tokenizing_distributed_data_loader_flat(*args, **kwargs):
+    """Helper that omits state_dict from yields."""
+    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_flat(*args, **kwargs):
         yield inputs, targets

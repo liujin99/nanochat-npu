@@ -27,7 +27,9 @@ import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, \
-    tokenizing_distributed_data_loader_with_state_bos_bestfit
+    tokenizing_distributed_data_loader_with_state_bos_bestfit, \
+    tokenizing_distributed_data_loader_flat, \
+    tokenizing_distributed_data_loader_with_state_flat
 from scripts.base_eval import evaluate_core
 
 import warnings; warnings.filterwarnings("ignore", category=UserWarning)
@@ -88,6 +90,8 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 default_mid_train_data = os.path.join(get_base_dir(), "mid_train_data")
 parser.add_argument("--data-dir", type=str, default=default_mid_train_data,
                     help="directory containing high-quality training data")
+parser.add_argument("--loader", type=str, default="bos_bestfit", choices=["bos_bestfit", "flat"],
+                    help="dataloader strategy: bos_bestfit (crop-and-discard) or flat (zero waste, document packing)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -225,12 +229,20 @@ if args.load_optimizer:
 
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
 
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-    tokenizer, args.device_batch_size, args.max_seq_len, split="train",
-    device=device, tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
-    tokenizer, args.device_batch_size, args.max_seq_len, split="val",
-    device=device, tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
+if args.loader == "flat":
+    train_loader = tokenizing_distributed_data_loader_with_state_flat(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+        device=device, tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_flat(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="val",
+        device=device, tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+        device=device, tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="val",
+        device=device, tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
 x, y, dataloader_state_dict = next(train_loader)
 x = x.to(device, non_blocking=True)
 y = y.to(device, non_blocking=True)
