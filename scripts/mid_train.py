@@ -290,6 +290,8 @@ while True:
             min_val_bpb = val_bpb
         wandb_run.log({"step": step, "val/bpb": val_bpb})
         model.train()
+        if device_type == "npu":
+            torch.npu.empty_cache()
 
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
@@ -309,6 +311,8 @@ while True:
         log_data["centered_results"] = results["centered_results"]
         wandb_run.log(log_data)
         model.train()
+        if device_type == "npu":
+            torch.npu.empty_cache()
 
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         torch.npu.empty_cache()
@@ -321,6 +325,8 @@ while True:
             sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
+        if device_type == "npu":
+            torch.npu.empty_cache()
 
     if last_step or (step > 0 and args.save_every > 0 and step % args.save_every == 0):
         output_dirname = args.model_tag if args.model_tag else f"d{depth}"
