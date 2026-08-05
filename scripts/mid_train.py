@@ -243,6 +243,7 @@ else:
     build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
         tokenizer, args.device_batch_size, args.max_seq_len, split="val",
         device=device, tokenizer_threads=16, tokenizer_batch_size=256, buffer_size=2000, data_dir=args.data_dir)
+print0(f"Using loader: {args.loader}")
 x, y, dataloader_state_dict = next(train_loader)
 x = x.to(device, non_blocking=True)
 y = y.to(device, non_blocking=True)

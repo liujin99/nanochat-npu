@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import logging
 
-from nanochat.common import get_dist_info
+from nanochat.common import get_dist_info, print0
 from nanochat.dataset import list_parquet_files
 
 logger = logging.getLogger(__name__)
@@ -230,6 +230,7 @@ def tokenizing_distributed_data_loader_with_state_flat(
     targets = gpu_buffer[B * T:].view(B, T)
 
     flat_buffer = np.empty(needed_tokens, dtype=np.int64)
+    _first_batch = True
 
     while True:
         pos = 0
@@ -250,6 +251,13 @@ def tokenizing_distributed_data_loader_with_state_flat(
         if current_idx > 1000:
             del token_lists[:current_idx]
             current_idx = 0
+
+        if _first_batch:
+            print0(f"[flat_loader] B={B}, T={T}, needed_tokens={needed_tokens}, "
+                   f"flat_buffer[:12]={flat_buffer[:min(12, needed_tokens)].tolist()}, "
+                   f"current_idx={current_idx}, current_offset={current_offset}, "
+                   f"buffer_docs={len(token_lists)}")
+            _first_batch = False
 
         row_buffer.copy_(torch.from_numpy(flat_buffer).view(B, row_capacity))
         cpu_inputs.copy_(row_buffer[:, :-1])
