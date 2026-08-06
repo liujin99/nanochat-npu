@@ -74,9 +74,9 @@ parser.add_argument("--matrix-lr", type=float, default=None,
 # -------------------------------------------------------
 
 parser.add_argument("--lr-scale", type=float, default=1.0, help="工业界：直接缩放预训练学习率 (1.0 = 完全接续)")
-parser.add_argument("--weight-decay", type=float, default=0.28,
-                    help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
+parser.add_argument("--weight-decay", type=float, default=0.1,
+                    help="weight decay for the Muon optimizer (for weights). 0.1 per DeepSeek V3 / Kimi K2 mid-training recipe")
+parser.add_argument("--warmup-ratio", type=float, default=0.05, help="ratio of iterations for LR warmup (lets optimizer adapt to new data distribution)")
 parser.add_argument("--warmdown-ratio", type=float, default=0.9, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR (与预训练一致)")
 parser.add_argument("--eval-every", type=int, default=100, help="evaluate val bpb every N steps (-1 = disable)")
