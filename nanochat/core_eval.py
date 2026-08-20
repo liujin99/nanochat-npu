@@ -300,25 +300,29 @@ def prepare_example(idx, data, tokenizer, task_meta, max_seq_len=None):
 
 
 def judge_example(losses, predictions, input_ids, local_start_idxs, local_end_idxs, task_type, gold):
-    """Judge correctness from pre-computed losses/predictions for one example's slice."""
+    """Judge correctness from pre-computed losses/predictions for one example's slice.
+    Returns (is_correct, nll_gold) where nll_gold is the teacher-forced NLL on the gold answer.
+    """
     if task_type == 'language_modeling':
         si = local_start_idxs[0]
         ei = local_end_idxs[0]
         predicted_tokens = predictions[0, si-1:ei-1]
         actual_tokens = input_ids[0, si:ei]
-        return torch.all(predicted_tokens == actual_tokens).item()
+        is_correct = torch.all(predicted_tokens == actual_tokens).item()
+        nll_gold = losses[0, si-1:ei-1].mean().item()
+        return is_correct, nll_gold
     elif task_type in ['multiple_choice', 'schema']:
         mean_losses = [losses[i, si-1:ei-1].mean().item()
                         for i, (si, ei) in enumerate(zip(local_start_idxs, local_end_idxs))]
         pred_idx = mean_losses.index(min(mean_losses))
-        return pred_idx == gold
+        return pred_idx == gold, mean_losses[gold]
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
 
 @torch.no_grad()
 def evaluate_example(idx, model, tokenizer, data, device, task_meta):
-    """Evaluate a single example, return True if correct, False otherwise"""
+    """Evaluate a single example, return (is_correct, nll_gold)."""
     max_seq_len = getattr(model, 'max_seq_len', None)
     tokens, start_idxs, end_idxs, task_type, gold = prepare_example(
         idx, data, tokenizer, task_meta, max_seq_len)
@@ -335,10 +339,12 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
     """
     Evaluate one task across many examples with DDP striding.
     When eval_batch_size > 1, multiple examples are batched into a single forward pass.
+    Returns (mean_correct, mean_nll) where mean_nll is the average teacher-forced NLL on gold answers.
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    nlls = torch.zeros(len(data), dtype=torch.float32, device=device)
 
     max_seq_len = getattr(model, 'max_seq_len', None)
     pad_token_id = tokenizer.get_bos_token_id()
@@ -347,8 +353,9 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
 
     if eval_batch_size <= 1:
         for idx in my_indices:
-            is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+            is_correct, nll_gold = evaluate_example(idx, model, tokenizer, data, device, task_meta)
             correct[idx] = float(is_correct)
+            nlls[idx] = nll_gold
     else:
         current_batch_size = eval_batch_size
         chunk_start = 0
@@ -381,8 +388,9 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
                         current_batch_size = max(1, current_batch_size // 2)
                         continue
                     for idx in chunk:
-                        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+                        is_correct, nll_gold = evaluate_example(idx, model, tokenizer, data, device, task_meta)
                         correct[idx] = float(is_correct)
+                        nlls[idx] = nll_gold
                     chunk_start += len(chunk)
                     continue
                 raise
@@ -393,21 +401,27 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
                 local_losses = losses[b:e]
                 local_preds = predictions[b:e]
                 local_input = input_ids[b:e]
-                is_correct = judge_example(
+                is_correct, nll_gold = judge_example(
                     local_losses, local_preds, local_input,
                     all_meta[j][1], all_meta[j][2], task_type, gold)
                 correct[idx] = float(is_correct)
+                nlls[idx] = nll_gold
             chunk_start += len(chunk)
 
     if world_size > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(nlls, op=dist.ReduceOp.SUM)
     mean_correct = correct.mean().item()
-    return mean_correct
+    mean_nll = nlls.mean().item()
+    return mean_correct, mean_nll
 
 
 @torch.no_grad()
 def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batch_size=8):
+    """Evaluate generation task: accuracy via autoregressive generation + teacher-forced NLL.
+    Returns (mean_correct, mean_nll).
+    """
     import gc
     from nanochat.engine import Engine
 
@@ -423,6 +437,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
     max_prompt_len = (max_seq_len - max_gen_tokens) if max_seq_len else None
 
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    nlls = torch.zeros(len(data), dtype=torch.float32, device=device)
     my_indices = list(range(rank, len(data), world_size))
 
     engine = Engine(model, tokenizer)
@@ -461,7 +476,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
         if max_prompt_len and len(prompt_tokens) > max_prompt_len:
             prompt_tokens = prompt_tokens[:max_prompt_len]
 
-        prepared.append((idx, prompt_tokens, gold_answer))
+        prepared.append((idx, prompt_tokens, gold_answer, prompt))
 
     local_correct = 0.0
     local_done = 0
@@ -491,7 +506,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
             if is_oom and current_batch_size > 1:
                 current_batch_size = max(1, current_batch_size // 2)
                 continue
-            for idx, prompt_tokens, gold in batch:
+            for idx, prompt_tokens, gold, _ in batch:
                 local_done += 1
                 try:
                     generated, _ = engine.generate_batch(
@@ -530,6 +545,33 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
 
         batch_start = batch_end
 
+    # Compute teacher-forced NLL on gold answers
+    print0(f"  [{label}] Computing teacher-forced NLL on gold answers...")
+    for idx, prompt_tokens, _, prompt in prepared:
+        item = data[idx]
+        answer_text = str(item['answer'])
+        full_tokens = tokenizer(prompt + answer_text, prepend=bos_token_id)
+        start_idx = len(prompt_tokens)
+        end_idx = len(full_tokens)
+        if end_idx <= start_idx:
+            nlls[idx] = 0.0
+            continue
+        if max_seq_len and len(full_tokens) > max_seq_len:
+            num_to_crop = len(full_tokens) - max_seq_len
+            full_tokens = full_tokens[-max_seq_len:]
+            start_idx = max(0, start_idx - num_to_crop)
+            end_idx = len(full_tokens)
+        if end_idx <= start_idx:
+            nlls[idx] = 0.0
+            continue
+        input_ids = stack_sequences([full_tokens], bos_token_id).to(device)
+        try:
+            losses, _ = forward_model(model, input_ids)
+            nlls[idx] = losses[0, start_idx-1:end_idx-1].mean().item()
+        except RuntimeError:
+            nlls[idx] = 0.0
+            print0(f"  [{label}] NLL computation failed at example {idx}, skipping")
+
     if device.type == "npu":
         torch.npu.empty_cache()
     elif device.type == "cuda":
@@ -542,10 +584,11 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
             any_oom = oom_flag[0].item() > 0.5
             if any_oom:
                 print0(f"  [{label}] OOM detected, returning partial result")
-                return correct.mean().item()
+                return correct.mean().item(), nlls.mean().item()
             dist.barrier()
             dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+            dist.all_reduce(nlls, op=dist.ReduceOp.SUM)
         except RuntimeError as e:
             print0(f"  [{label}] Collective communication failed: {str(e)[:200]}, returning local result")
-            return correct.mean().item()
-    return correct.mean().item()
+            return correct.mean().item(), nlls.mean().item()
+    return correct.mean().item(), nlls.mean().item()

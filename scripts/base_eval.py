@@ -332,6 +332,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
     # Evaluate each task
     results = {}
     centered_results = {}
+    nll_results = {}
     for tasks, data_base_path in all_task_groups:
         for task in tasks:
             start_time = time.time()
@@ -358,14 +359,15 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
                 data = data[:max_per_task]
 
             if task_meta['task_type'] == 'generation':
-                accuracy = evaluate_generation_task(model, tokenizer, data, device, task_meta)
+                accuracy, nll = evaluate_generation_task(model, tokenizer, data, device, task_meta)
             else:
-                accuracy = evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=core_eval_batch_size)
+                accuracy, nll = evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=core_eval_batch_size)
             if device.type == "npu":
                 torch.npu.empty_cache()
             elif device.type == "cuda":
                 torch.cuda.empty_cache()
             results[label] = accuracy
+            nll_results[label] = nll
             random_baseline = random_baselines.get(label, 0.0)
             if random_baseline > 0:
                 centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
@@ -373,7 +375,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
                 centered_result = accuracy
             centered_results[label] = centered_result
             elapsed = time.time() - start_time
-            print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
+            print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | nll: {nll:.4f} | time: {elapsed:.2f}s")
 
     # CORE metric: only meaningful when all 22 DCLM core tasks are evaluated
     core_centered = {k: v for k, v in centered_results.items() if k in core_task_labels}
@@ -386,11 +388,17 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
     stem_centered = {k: v for k, v in centered_results.items() if k in STEM_BENCHMARK_LABELS}
     stem_metric = sum(stem_centered.values()) / len(stem_centered) if stem_centered else None
 
+    # STEM NLL metric: average NLL over STEM_BENCHMARK_LABELS that were actually evaluated
+    stem_nll = {k: v for k, v in nll_results.items() if k in STEM_BENCHMARK_LABELS}
+    stem_nll_metric = sum(stem_nll.values()) / len(stem_nll) if stem_nll else None
+
     out = {
         "results": results,
         "centered_results": centered_results,
         "core_metric": core_metric,
         "stem_metric": stem_metric,
+        "nll_results": nll_results,
+        "stem_nll_metric": stem_nll_metric,
     }
     return out
 
@@ -529,20 +537,24 @@ def main():
             output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
-                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
+                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}, {'NLL':<10}\n")
                 for label in core_results["results"]:
                     acc = core_results["results"][label]
                     centered = core_results["centered_results"][label]
-                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
+                    nll = core_results.get("nll_results", {}).get(label, 0.0)
+                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}, {nll:<10.6f}\n")
                 if core_results['core_metric'] is not None:
-                    f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
+                    f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}, {'':<10}\n")
                 if core_results['stem_metric'] is not None:
-                    f.write(f"{'STEM':<35}, {'':<10}, {core_results['stem_metric']:<10.6f}\n")
+                    stem_nll = core_results.get('stem_nll_metric', 0.0)
+                    f.write(f"{'STEM':<35}, {'':<10}, {core_results['stem_metric']:<10.6f}, {stem_nll:<10.6f}\n")
             print0(f"\nResults written to: {output_csv_path}")
             if core_results['core_metric'] is not None:
                 print0(f"CORE metric: {core_results['core_metric']:.4f}")
             if core_results['stem_metric'] is not None:
                 print0(f"STEM metric: {core_results['stem_metric']:.4f}")
+            if core_results.get('stem_nll_metric') is not None:
+                print0(f"STEM NLL: {core_results['stem_nll_metric']:.4f}")
 
     # --- Log to report ---
     from nanochat.report import get_report
@@ -551,6 +563,8 @@ def main():
     if core_results:
         report_data[0]["CORE metric"] = core_results["core_metric"]
         report_data.append(core_results["centered_results"])
+        if core_results.get("nll_results"):
+            report_data.append(core_results["nll_results"])
 
     if bpb_results:
         report_data[0]["train bpb"] = bpb_results.get("train")
