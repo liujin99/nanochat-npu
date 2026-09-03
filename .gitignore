@@ -4,6 +4,8 @@ __pycache__/
 dev-ignore/
 report.md
 eval_bundle/
+.ipynb_checkpoints/
+nanochat.egg-info/
 
 # Secrets
 .env
