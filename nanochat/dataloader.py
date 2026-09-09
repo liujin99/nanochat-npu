@@ -40,6 +40,24 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=N
     parquet_paths = list_parquet_files(data_dir=data_dir, warn_on_legacy=warn_on_legacy)
     assert len(parquet_paths) != 0, f"No dataset parquet files found in {data_dir}, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+    assert len(parquet_paths) != 0, f"split '{split}' got 0 parquet files from {data_dir}, did you run dataset.py?"
+
+    # DDP row-group sharding below is PER FILE: rg_idx starts at the
+    # global rank and strides by world_size, so ranks >= a file's
+    # num_row_groups read NOTHING from that file — and when every file
+    # is that short the loop below spins reopening files forever without
+    # ever yielding (multi-node runs 20260909_145450/154328/165952 hung
+    # ~20min on exactly this at ws=24 vs 16-row-group shards; single-node
+    # ws=8 never hits it). Fail loudly instead of hanging the job.
+    min_rg = min(pq.ParquetFile(p).metadata.num_row_groups
+                 for p in parquet_paths)
+    if ddp_world_size > min_rg:
+        raise RuntimeError(
+            f"row-group starvation: world_size={ddp_world_size} but "
+            f"{parquet_paths[0]} (and siblings) have as few as {min_rg} "
+            f"row groups per file — ranks {min_rg}..{ddp_world_size - 1} "
+            f"would read no data and the loader would spin forever; "
+            f"repartition the shards with more row groups per file")
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
