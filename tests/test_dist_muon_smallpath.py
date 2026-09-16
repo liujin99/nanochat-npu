@@ -1,5 +1,5 @@
 """DistMuonAdamW small-group path (all_reduce/broadcast) vs stacked path —
-gloo CPU equivalence test.
+gloo CPU equivalence test with THREE anchors.
 
 Background (prod4 2026-09-15, job 10c9fc37): the stacked reduce_scatter pads
 a Muon group to chunk_size * world_size slots, so a group SMALLER than
@@ -10,11 +10,17 @@ only, _SMALL_PATH_MIN_WS) through per-param all_reduce + round-robin
 ownership + owner-broadcast, plus builds the stacked path's buffer in place
 (no torch.stack transient).
 
-Equivalence strategy: dyadic-valued gradients (multiples of 1/4 with
-rank offsets) make AVG exact in any reduction order at power-of-two world
-sizes, so the OLD implementation (loaded from git HEAD) and the NEW one
-must produce BIT-IDENTICAL parameters — the test verifies the plumbing
-(scatter/gather vs reduce/broadcast), not collective numerics.
+Anchors:
+  1. OLD implementation (git HEAD) vs NEW, bitwise — plumbing equivalence.
+  2. Single-GPU MuonAdamW (untouched reference class) fed PRE-AVERAGED
+     grads vs BOTH distributed paths, bitwise — semantic equivalence
+     against the canonical algorithm, independent of the old dist code.
+  3. Cross-rank consistency (data-parallel invariant).
+
+Dyadic-valued gradients (multiples of 1/4 with rank offsets) make AVG exact
+in any reduction order at power-of-two world sizes, so bitwise comparison
+is meaningful. A sync-shim covers gloo's missing Work.getFuture (semantics
+identical; applied uniformly).
 
 Run: python tests/test_dist_muon_smallpath.py   (also pytest-compatible)
 """
@@ -30,6 +36,9 @@ import torch.multiprocessing as mp
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORT = int(os.environ.get("TEST_PORT", "29633"))
+
+HP_MUON = dict(lr=0.02, momentum=0.95, ns_steps=5, beta2=0.99, weight_decay=0.01)
+HP_ADAMW = dict(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
 
 
 def _load_module(name: str, path: str):
@@ -54,35 +63,50 @@ def load_impls():
             _load_module("optim_new", new_path), old_path)
 
 
-def build_params():
-    """Same-seed identical init across ranks; returns (muon_groups, adamw_group)."""
+def build_params(sizes):
+    """Same-seed identical init across ranks AND the single-GPU reference.
+    sizes: tuple of (n, shape) for the Muon groups."""
     torch.manual_seed(1234)
     def mk(n, shape):
         return [torch.nn.Parameter(
             torch.randn(shape, dtype=torch.float32) * 0.1) for _ in range(n)]
-    groups = [
-        dict(params=mk(3, (8, 8)), kind="muon", lr=0.02, momentum=0.95,
-             ns_steps=5, beta2=0.99, weight_decay=0.01),
-        dict(params=mk(9, (12, 5)), kind="muon", lr=0.02, momentum=0.95,
-             ns_steps=5, beta2=0.99, weight_decay=0.01),
-        dict(params=mk(2, (5, 12)), kind="muon", lr=0.02, momentum=0.95,
-             ns_steps=5, beta2=0.99, weight_decay=0.01),
-    ]
+    groups = [dict(params=mk(n, shape), kind="muon", **HP_MUON)
+              for n, shape in sizes]
     adamw = dict(params=[torch.nn.Parameter(torch.randn(64) * 0.1)],
-                 kind="adamw", lr=1e-3, betas=(0.9, 0.95), eps=1e-8,
-                 weight_decay=0.01)
+                 kind="adamw", **HP_ADAMW)
     return groups, adamw
 
 
-def set_dyadic_grads(groups, adamw, step, rank):
-    """Dyadic values (multiples of 1/4): AVG is exact in any reduction order
-    at power-of-two world sizes — old vs new must match bitwise."""
+def _base_grads(groups, adamw, step):
+    """Deterministic dyadic base values; identical sequence everywhere."""
     g = torch.Generator().manual_seed(10_000 + step)
+    bases = []
     for grp in groups + [adamw]:
-        for i, p in enumerate(grp["params"]):
-            base = torch.randint(-7, 8, p.shape, generator=g).float() / 4.0
-            val = base + rank * 0.25 + step * 0.5
-            p.grad = val.clone()
+        for p in grp["params"]:
+            bases.append(torch.randint(-7, 8, p.shape, generator=g).float() / 4.0)
+    return bases
+
+
+def set_grads(groups, adamw, step, rank):
+    """rank-aware grads: base + rank*0.25 + step*0.5 (all dyadic)."""
+    bases = _base_grads(groups, adamw, step)
+    k = 0
+    for grp in groups + [adamw]:
+        for p in grp["params"]:
+            p.grad = bases[k] + rank * 0.25 + step * 0.5
+            k += 1
+
+
+def set_avg_grads(groups, adamw, step, world):
+    """pre-averaged grads for the single-GPU reference: base + (ws-1)/2*0.25
+    + step*0.5 — the exact AVG the distributed ranks compute."""
+    bases = _base_grads(groups, adamw, step)
+    off = (world - 1) / 2 * 0.25 + step * 0.5
+    k = 0
+    for grp in groups + [adamw]:
+        for p in grp["params"]:
+            p.grad = bases[k] + off
+            k += 1
 
 
 class _SyncWork:
@@ -113,33 +137,47 @@ def _patch_dist_sync():
         setattr(dist, name, wrap(getattr(dist, name)))
 
 
-def run_rank(rank, world, use_new, gate, port, outdir):
+def _flat(groups, adamw):
+    return torch.cat([p.detach().reshape(-1)
+                      for grp in groups + [adamw] for p in grp["params"]])
+
+
+def run_rank(rank, world, use_new, gate, port, outdir, sizes):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=world)
     _patch_dist_sync()
     old_mod, new_mod, _ = load_impls()
     mod = new_mod if use_new else old_mod
-    groups, adamw = build_params()
+    groups, adamw = build_params(sizes)
     opt = mod.DistMuonAdamW(groups + [adamw])
     if use_new and gate is not None:
         opt._SMALL_PATH_MIN_WS = gate  # instance attr shadows the class default
     for step in range(3):
-        set_dyadic_grads(groups, adamw, step, rank)
+        set_grads(groups, adamw, step, rank)
         opt.step()
-    flat = torch.cat([p.detach().reshape(-1)
-                      for grp in groups + [adamw] for p in grp["params"]])
-    torch.save(flat, os.path.join(outdir, f"rank{rank}.pt"))
+    torch.save(_flat(groups, adamw), os.path.join(outdir, f"rank{rank}.pt"))
     dist.destroy_process_group()
 
 
-def run_impl(use_new, gate, world, port):
-    import tempfile
+def run_impl(use_new, gate, world, port, sizes):
     outdir = tempfile.mkdtemp(prefix="muon_eq_")
-    mp.start_processes(run_rank, args=(world, use_new, gate, port, outdir),
+    mp.start_processes(run_rank,
+                       args=(world, use_new, gate, port, outdir, sizes),
                        nprocs=world, join=True, start_method="spawn")
     return [torch.load(os.path.join(outdir, f"rank{r}.pt"))
             for r in range(world)]
+
+
+def single_gpu_reference(world, sizes):
+    """Anchor 2: the untouched single-GPU class on pre-averaged grads."""
+    _, new_mod, _ = load_impls()
+    groups, adamw = build_params(sizes)
+    opt = new_mod.MuonAdamW(groups + [adamw])
+    for step in range(3):
+        set_avg_grads(groups, adamw, step, world)
+        opt.step()
+    return _flat(groups, adamw)
 
 
 def check(name, ok, detail=""):
@@ -149,44 +187,66 @@ def check(name, ok, detail=""):
 
 
 def main():
-    results = []
+    r = []
+    BASE = ((3, (8, 8)), (9, (12, 5)), (2, (5, 12)))
 
-    # ── 1. gate OFF (default 8, ws=4): stacked path both impls — validates
-    #       the in-place stack build (Fix B) is copy-equivalent, bitwise.
-    old = run_impl(False, None, 4, PORT)
-    new = run_impl(True, None, 4, PORT + 1)
-    results.append(check("ws=4 gate=8 (stacked both): old == new bitwise",
-                         all(torch.equal(a, b) for a, b in zip(old, new))))
-    results.append(check("ws=4: ranks consistent within impl",
-                         all(torch.equal(old[0], o) for o in old)
-                         and all(torch.equal(new[0], n) for n in new)))
+    # ── anchor 1+3: old vs new, gate off (stacked both; validates the
+    #    in-place stack build bitwise)
+    old = run_impl(False, None, 4, PORT, BASE)
+    new = run_impl(True, None, 4, PORT + 1, BASE)
+    r.append(check("ws=4 gate=8 (stacked both): old == new bitwise",
+                   all(torch.equal(a, b) for a, b in zip(old, new))))
+    r.append(check("ws=4: ranks consistent within impl",
+                   all(torch.equal(old[0], o) for o in old)
+                   and all(torch.equal(new[0], n) for n in new)))
 
-    # ── 2. gate ON (ws=4): groups n=3 and n=2 take the small path in NEW,
-    #       stacked in OLD — must still match bitwise (dyadic AVG is exact).
-    new_small = run_impl(True, 1, 4, PORT + 2)
-    results.append(check("ws=4 gate=1 (small path n<4): old == new bitwise",
-                         all(torch.equal(a, b) for a, b in zip(old, new_small))))
-    results.append(check("ws=4 small path: ranks consistent",
-                         all(torch.equal(new_small[0], n) for n in new_small)))
+    # ── anchor 1+3: gate on (small path n<4) — bitwise vs old
+    new_small = run_impl(True, 1, 4, PORT + 2, BASE)
+    r.append(check("ws=4 gate=1 (small path n<4): old == new bitwise",
+                   all(torch.equal(a, b) for a, b in zip(old, new_small))))
+    r.append(check("ws=4 small path: ranks consistent",
+                   all(torch.equal(new_small[0], n) for n in new_small)))
 
-    # ── 3. ws=8, gate=1: n=3/n=2 small, n=9 stacked(chunk=2, padded=16).
-    old8 = run_impl(False, None, 8, PORT + 3)
-    new8 = run_impl(True, 1, 8, PORT + 4)
-    results.append(check("ws=8 gate=1 (mixed paths): old == new bitwise",
-                         all(torch.equal(a, b) for a, b in zip(old8, new8))))
-    results.append(check("ws=8: ranks consistent within impl",
-                         all(torch.equal(old8[0], o) for o in old8)
-                         and all(torch.equal(new8[0], n) for n in new8)))
+    # ── anchor 2: single-GPU reference on pre-averaged grads, both impls
+    ref = single_gpu_reference(4, BASE)
+    r.append(check("ws=4: single-GPU reference == dist old (bitwise)",
+                   torch.equal(ref, old[0])))
+    r.append(check("ws=4: single-GPU reference == dist new small path (bitwise)",
+                   torch.equal(ref, new_small[0])))
 
-    # ── 4. sanity: the two impls actually train (params moved from init)
-    init = build_params()[0][0]["params"][0].detach().clone()
-    results.append(check("params actually updated (not a no-op)",
-                         not torch.equal(init, new8[0][:init.numel()]
-                                         .reshape(init.shape))))
+    # ── boundary sizes at ws=8: n = 7 (small), 8 (stacked, zero pad),
+    #    9 (stacked, chunk=2 padded=16) — gate on
+    B8 = ((7, (8, 8)), (8, (6, 6)), (9, (12, 5)))
+    old8 = run_impl(False, None, 8, PORT + 3, B8)
+    new8 = run_impl(True, 1, 8, PORT + 4, B8)
+    r.append(check("ws=8 boundary n=7/8/9: old == new bitwise",
+                   all(torch.equal(a, b) for a, b in zip(old8, new8))))
+    ref8 = single_gpu_reference(8, B8)
+    r.append(check("ws=8: single-GPU reference == dist new (bitwise)",
+                   torch.equal(ref8, new8[0])))
+    r.append(check("ws=8: ranks consistent",
+                   all(torch.equal(old8[0], o) for o in old8)
+                   and all(torch.equal(new8[0], n) for n in new8)))
 
-    n_pass = sum(results)
-    print(f"\n{n_pass}/{len(results)} checks passed")
-    return 0 if n_pass == len(results) else 1
+    # ── ws=16, boundary n=15/16/17 — wider small path
+    B16 = ((15, (8, 8)), (16, (6, 6)), (17, (12, 5)))
+    old16 = run_impl(False, None, 16, PORT + 5, B16)
+    new16 = run_impl(True, 1, 16, PORT + 6, B16)
+    r.append(check("ws=16 boundary n=15/16/17: old == new bitwise",
+                   all(torch.equal(a, b) for a, b in zip(old16, new16))))
+    ref16 = single_gpu_reference(16, B16)
+    r.append(check("ws=16: single-GPU reference == dist new (bitwise)",
+                   torch.equal(ref16, new16[0])))
+
+    # ── sanity: params actually train
+    init = build_params(BASE)[0][0]["params"][0].detach().clone()
+    r.append(check("params actually updated (not a no-op)",
+                   not torch.equal(init, new16[0][:init.numel()]
+                                   .reshape(init.shape))))
+
+    n_pass = sum(r)
+    print(f"\n{n_pass}/{len(r)} checks passed")
+    return 0 if n_pass == len(r) else 1
 
 
 if __name__ == "__main__":
