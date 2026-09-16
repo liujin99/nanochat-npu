@@ -186,12 +186,16 @@ with tempfile.TemporaryDirectory() as td:
             ["doc-%d-%d" % (i, j) for j in range(200)], 100)
         files.append(os.path.join(td, "p%05d.parquet" % i))
     t0 = time.time()
-    n_ref = sum(1 for _ in ref_stream_texts_uniform(files))
+    a = list(ref_stream_texts_uniform(files))
     t_ref = time.time() - t0
     t0 = time.time()
-    n_new = sum(1 for _ in new_stream(files))
+    b = list(new_stream(files))
     t_new = time.time() - t0
-    check("perf: same doc count (40000)", n_ref == n_new == 40000)
+    check("perf: same doc count (40000)", len(a) == len(b) == 40000)
+    check("perf: no duplicates within one drain (all 40000 unique)",
+          len(set(b)) == 40000,
+          "the only path to duplicates is premature active-list "
+          "exhaustion -> endless_generator restarts from file 0")
     check("perf: incremental active is faster",
           t_new < t_ref,
           "ref %.2fs vs new %.2fs (%.1fx)" % (t_ref, t_new,
