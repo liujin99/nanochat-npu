@@ -231,13 +231,25 @@ def stream_texts_uniform(file_list, shuffle_buffer=10000):
     current_batches = [None] * len(readers)
     current_ptrs = [0] * len(readers)
 
+    # Active readers maintained INCREMENTALLY (2026-09-16): the original
+    # rebuilt this membership scan — O(num_files) — for EVERY yielded
+    # doc, so doc-level mixing cost O(docs x files): prod4's random3b mix
+    # drew from 397 STEM files at ~28K docs/s, single-core (~1% of a
+    # 192-vCPU submit host). Membership AND order stay identical to the
+    # old ascending-i rebuild (the outer exception path re-derives it the
+    # old way), so random.choice consumes the exact same draws from the
+    # shared global random state and the yielded sequence is unchanged —
+    # asserted against the verbatim old implementation in
+    # tests/test_stream_uniform.py.
+    def _dry(i):
+        return (row_group_indices[i] >= readers[i].num_row_groups
+                and (current_batches[i] is None
+                     or current_ptrs[i] >= len(current_batches[i])))
+
+    active = [i for i in range(len(readers)) if not _dry(i)]
+
     while True:
         try:
-            active = []
-            for i, r in enumerate(readers):
-                if row_group_indices[i] < r.num_row_groups or (current_batches[i] is not None and current_ptrs[i] < len(current_batches[i])):
-                    active.append(i)
-
             if not active:
                 return
 
@@ -253,15 +265,20 @@ def stream_texts_uniform(file_list, shuffle_buffer=10000):
                     row_group_indices[idx] += 1
                 except:
                     row_group_indices[idx] += 1
+                    if _dry(idx):
+                        active.remove(idx)
                     continue
 
             text = current_batches[idx][current_ptrs[idx]]
             current_ptrs[idx] += 1
             if text and len(text.strip()) > 0:
                 yield text
+            if _dry(idx):
+                active.remove(idx)
         except GeneratorExit:
             return
         except:
+            active = [i for i in range(len(readers)) if not _dry(i)]
             continue
 
 # -----------------------------------------------------------------------------
