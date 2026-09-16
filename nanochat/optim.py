@@ -446,6 +446,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
     - Optimizer state (momentum_buffer, second_momentum_buffer) is sharded by chunk.
     - Padding: if K doesn't divide evenly, we zero-pad to (ceil(K/N) * N) for comm,
       then ignore the padding when copying back.
+    - Small groups (K < world_size, multinode only — see _SMALL_PATH_MIN_WS): the
+      padded stack would be world_size x shape REGARDLESS of K (a 28-member group
+      at ws=64 costs 4 GiB bf16 — the prod4 2026-09-15 first-step OOM). These take
+      the all_reduce/broadcast path instead: per-param all_reduce, round-robin
+      ownership, per-param state, owner broadcasts the update. No stack, no padding.
 
     Buffer Reuse:
     - For Muon, we allocate stacked_grads for reduce_scatter input, then reuse the
@@ -460,6 +465,13 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
 
     """
+
+    # Small-group path activation threshold: the all_reduce/broadcast path
+    # (see _reduce_muon_small) is only taken when world_size EXCEEDS this.
+    # Single-node runs are ws=8, so they never leave the stacked path and
+    # stay byte-compatible with existing optimizer-state checkpoints.
+    _SMALL_PATH_MIN_WS = 8
+
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
         # ===================== NPU适配：0-D张量不再强制CPU =====================
@@ -506,23 +518,50 @@ class DistMuonAdamW(torch.optim.Optimizer):
     def _reduce_muon(self, group: dict, world_size: int) -> dict:
         """Launch async reduce op for Muon group. Returns info dict."""
         params = group['params']
+        if len(params) < world_size and world_size > self._SMALL_PATH_MIN_WS:
+            return self._reduce_muon_small(group, world_size)
         chunk_size = (len(params) + world_size - 1) // world_size
         padded_num_params = chunk_size * world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
 
-        # Stack grads and zero-pad to padded_num_params
-        grad_stack = torch.stack([p.grad for p in params])
+        # Build the padded stack IN PLACE: the old torch.stack + copy held a
+        # full group-grad transient alongside the padded stack, doubling the
+        # peak of this step (prod4 2026-09-16 disk/OOM triage).
         stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device) #  适配NPU：指定设备
-        stacked_grads[:len(params)].copy_(grad_stack)
+        for i, q in enumerate(params):
+            stacked_grads[i].copy_(q.grad)
         if len(params) < padded_num_params:
             stacked_grads[len(params):].zero_()
 
         # Reduce_scatter to get this rank's chunk
-        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device) # 适配NPU：指定设备
+        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device) #  适配NPU：指定设备
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
 
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+
+    def _reduce_muon_small(self, group: dict, world_size: int) -> dict:
+        """Small-group path (len(params) < world_size, multinode only).
+
+        The stacked reduce_scatter pads the group to chunk_size * world_size
+        slots; for a group SMALLER than world_size the comm input is
+        world_size x shape regardless of n — d28's 28-layer groups at ws=64
+        needed 4 GiB bf16 (vs 2 GiB at ws=32) and the first optimizer.step()
+        OOM'd all 64 ranks (prod4 2026-09-15, job 10c9fc37). Instead:
+        all_reduce each grad in place (no stack at all), round-robin
+        ownership (param i owned by rank i % world_size — no padding), each
+        owner runs the fused kernel on its params via unsqueeze views, then
+        every param is broadcast from its owner. Numerically identical:
+        AVG over ranks either way, same kernel, same scalars.
+        Gated on world_size > _SMALL_PATH_MIN_WS (multinode arms always
+        cold-start the optimizer — load_optimizer=0 — so the per-param state
+        layout below never meets a stacked-state checkpoint).
+        """
+        futures = []
+        for p in group['params']:
+            futures.append(dist.all_reduce(
+                p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+        return dict(small=True, futures=futures)
 
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
@@ -565,8 +604,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
 
-    def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
+    def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute Muon updates, launch gather."""
+        if info.get('small'):
+            self._compute_muon_small(group, info, gather_list, rank, world_size)
+            return
         info['future'].wait()
         params = group['params']
         chunk_size = info['chunk_size']
@@ -615,6 +657,50 @@ class DistMuonAdamW(torch.optim.Optimizer):
         future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
+    def _compute_muon_small(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
+        """Wait for the per-param all_reduces, update owned params, broadcast.
+
+        Round-robin ownership: param i is owned (computed) by rank
+        i % world_size. Per-param momentum state (vs the stacked path's
+        group-level buffers) — multinode-only path, cold-start optimizer.
+        """
+        for fut in info['futures']:
+            fut.wait()
+        params = group['params']
+        p0 = params[0]
+        shape = p0.shape
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        second_shape = (shape[-2], 1) if shape[-2] >= shape[-1] else (1, shape[-1])
+
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"])
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+
+        for i, p in enumerate(params):
+            if i % world_size == rank:
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros(shape, dtype=p.dtype, device=p.device) # 适配NPU：指定设备
+                if "second_momentum_buffer" not in state:
+                    state["second_momentum_buffer"] = torch.zeros(second_shape, dtype=p.dtype, device=p.device) # 适配NPU：指定设备
+                # unsqueeze views: muon_step_fused updates its 2nd arg in
+                # place, so the real param/momentum tensors are updated
+                # directly. Owner-only — every rank holds identical inputs,
+                # the owner's result is authoritative.
+                muon_step_fused(
+                    p.grad.unsqueeze(0), p.unsqueeze(0),
+                    state["momentum_buffer"].unsqueeze(0),
+                    state["second_momentum_buffer"].unsqueeze(0),
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                    group["ns_steps"], red_dim,
+                )
+            # broadcast is a COLLECTIVE: every rank must call it for every
+            # param (the gloo equivalence test caught the owner-only variant
+            # deadlocking) — only the src differs.
+            future = dist.broadcast(p, src=i % world_size, async_op=True).get_future()
+            gather_list.append(dict(future=future, params=None))
+
     def _finish_gathers(self, gather_list: list) -> None:
         """Wait for all gathers and copy Muon params back."""
         for info in gather_list:
@@ -644,7 +730,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             if group['kind'] == 'adamw':
                 self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
-                self._compute_muon(group, info, gather_list, rank)
+                self._compute_muon(group, info, gather_list, rank, world_size)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
