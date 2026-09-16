@@ -197,6 +197,13 @@ def stack_sequences(tokens, pad_token_id):
     return input_ids
 
 
+# Row budget for forward_model's batch-axis slicing. 4096 = the training
+# micro-batch's per-forward row count (2 x 2048), proven over 2 x 2861
+# steps at ws=128 tonight; see forward_model's docstring for the OOM it
+# prevents.
+_EVAL_MAX_ROWS = 4096
+
+
 def batch_sequences_mc(tokenizer, prompts):
     # In multiple choice, contexts are the same but the continuation is different (common prefix)
     tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
@@ -229,26 +236,49 @@ def batch_sequences_lm(tokenizer, prompts):
 
 
 @torch.no_grad()
-def forward_model(model, input_ids):
+def forward_model(model, input_ids, max_rows=None):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
     The last column of losses is set to nan because we don't have autoregressive targets there.
+
+    Row-bounded forward: one (B, T) chunk with B*T rows makes the lm_head
+    emit a (B*T, vocab) logits tensor — at the target arms' eval batch
+    (8 examples x 4 MC choices, T up to 2048) that is 65536 x 32768 =
+    4.3 GB bf16 plus the fp32 CE workspace, a 16x larger footprint than
+    the training micro-batch (2 x 2048). At ws=128 (prod4 2026-09-16,
+    both arms, job 2e58bdab + d9b8dae3) the first such chunk failed
+    inside aclnnMatmul (ACL ERR00100, deterministically on rank 76 —
+    the only chunk that combined a full 8 examples with a 2048-truncated
+    one). Slice the batch axis so every forward stays within
+    _EVAL_MAX_ROWS (training-proven row count); CE and argmax are
+    row-independent, so slicing is exactly equivalent.
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
-    # Roll the tensor to the left by one position to get the (autoregressive) target ids
-    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # Calculate cross entropy at all positions
-    losses = torch.nn.functional.cross_entropy(
-        outputs.view(batch_size * seq_len, -1),
-        target_ids.view(batch_size * seq_len),
-        reduction='none'
-    ).view(batch_size, seq_len)
-    # Set the last column to be nan because there is no autoregressive loss there
-    losses[:, -1] = float('nan')
-    # Get the argmax predictions at each position
-    predictions = outputs.argmax(dim=-1)
-    return losses, predictions
+    if max_rows is None:
+        max_rows = _EVAL_MAX_ROWS
+    step = max(1, max_rows // seq_len)
+    losses_parts, pred_parts = [], []
+    for i in range(0, batch_size, step):
+        ids = input_ids[i:i + step]
+        b = ids.size(0)
+        outputs = model(ids)
+        # Roll the tensor to the left by one position to get the (autoregressive) target ids
+        target_ids = torch.roll(ids, shifts=-1, dims=1)
+        # Calculate cross entropy at all positions
+        losses = torch.nn.functional.cross_entropy(
+            outputs.view(b * seq_len, -1),
+            target_ids.view(b * seq_len),
+            reduction='none'
+        ).view(b, seq_len)
+        # Set the last column to be nan because there is no autoregressive loss there
+        losses[:, -1] = float('nan')
+        # Get the argmax predictions at each position
+        predictions = outputs.argmax(dim=-1)
+        losses_parts.append(losses)
+        pred_parts.append(predictions)
+    if len(losses_parts) == 1:
+        return losses_parts[0], pred_parts[0]
+    return torch.cat(losses_parts, dim=0), torch.cat(pred_parts, dim=0)
 
 
 def prepare_example(idx, data, tokenizer, task_meta, max_seq_len=None):
@@ -379,7 +409,13 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
             try:
                 losses, predictions = forward_model(model, input_ids)
             except RuntimeError as e:
-                if 'out of memory' in str(e).lower():
+                # NPU operator failures surface as "The Inner error is
+                # reported as above ... operator name is aclnnXxx"
+                # (ERR00100) — allocation failures that, like CUDA OOM,
+                # respond to halving the batch. prod4 2026-09-16: the
+                # original catch missed this signature and the eval died.
+                err = str(e).lower()
+                if 'out of memory' in err or 'aclnn' in err or 'inner error' in err:
                     if device.type == "npu":
                         torch.npu.empty_cache()
                     elif device.type == "cuda":
