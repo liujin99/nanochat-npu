@@ -445,6 +445,16 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
             chunk_start += len(chunk)
 
     if world_size > 1:
+        # Hot chunk loop -> pool reserved up to its ceiling -> the first
+        # collective needs driver-side memory HCCL cannot get (EL0004
+        # Memory_Allocation_Failure, the 401MiB comm-buffer class:
+        # 2026-08-28 speedrun Step 7 and prod4 2026-09-17 anchor
+        # b9e3def2 both died at exactly this barrier). Flush first —
+        # the generation task already flushes before its collectives.
+        if device.type == "npu":
+            torch.npu.empty_cache()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(nlls, op=dist.ReduceOp.SUM)
