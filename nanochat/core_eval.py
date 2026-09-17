@@ -133,6 +133,42 @@ def extract_answer(text, extractor_type):
     raise ValueError(f"Unknown answer extractor: {extractor_type}")
 
 
+# Stop-string truncation for generation tasks (lm-eval-harness `until`
+# semantics). A base model in few-shot completion never emits the chat EOS,
+# so after finishing the target answer it keeps generating hallucinated next
+# rounds ("Question: ... \nAnswer: ..." / "Problem: ... \n\nSolution: ...").
+# Our few-shot exemplars render as "{question}{delimiter}{answer}\n\n" with
+# BARE question text (no "Question:"/"Problem:" prefix like lm-eval's
+# templates), so the delimiter itself re-appearing is the only reliable
+# hallucination boundary. Gold-data verified 2026-09-17: 0 occurrences of
+# these strings inside the gsm8k/math answers AND questions (N=1319/500),
+# so a well-formed solution can never be cut mid-way.
+def apply_stop_strings(text, stop_strings):
+    """Cut generated text at the earliest stop-string occurrence."""
+    if not stop_strings:
+        return text
+    cut = len(text)
+    for s in stop_strings:
+        i = text.find(s)
+        if i != -1 and i < cut:
+            cut = i
+    return text[:cut]
+
+
+# Per-extractor "the model produced a parseable answer" marker for the
+# generation diagnostics (format-following proxy, independent of correctness).
+_ANSWER_MARKERS = {'gsm8k': '####', 'math': '\\boxed{'}
+
+# Teacher-forced NLL prompts stay pinned at the HISTORICAL budget
+# (max_seq_len - 256: every generation task ran with max_gen_tokens=256
+# until 2026-09-17). The generation cap is now a per-task protocol knob
+# (math_cot_500: 1024), and the generation prompt budget shrinks with it —
+# but letting the NLL prompt shrink too would silently re-define the NLL
+# column against every historical search point (math NLL is that benchmark's
+# main live signal). Registry override: 'nll_prompt_budget'.
+_NLL_FROZEN_GEN_CAP = 256
+
+
 def compare_answers(pred_answer, gold_answer, extractor_type):
     if pred_answer is None or gold_answer is None:
         return False
@@ -468,9 +504,19 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
     continuation_delimiter = task_meta['continuation_delimiter']
     answer_extractor = task_meta.get('answer_extractor', 'gsm8k')
     max_gen_tokens = task_meta.get('max_gen_tokens', 512)
+    stop_strings = task_meta.get('stop_strings', [])
+    marker = _ANSWER_MARKERS.get(answer_extractor)
     label = task_meta.get('label', 'unknown')
     max_seq_len = getattr(model, 'max_seq_len', None)
+    # The generation prompt must reserve the full generation window inside
+    # the model context; the NLL prompt budget is decoupled and frozen (see
+    # _NLL_FROZEN_GEN_CAP).
     max_prompt_len = (max_seq_len - max_gen_tokens) if max_seq_len else None
+    # Registry 'nll_prompt_budget' may exist with value None (base_eval
+    # passes task.get() unconditionally) — fall to the frozen default.
+    nll_prompt_budget = task_meta.get('nll_prompt_budget')
+    if nll_prompt_budget is None:
+        nll_prompt_budget = (max_seq_len - _NLL_FROZEN_GEN_CAP) if max_seq_len else None
 
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
     nlls = torch.zeros(len(data), dtype=torch.float32, device=device)
@@ -481,10 +527,51 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
 
     oom_flag = torch.tensor([0.0], device=device)
 
+    # Generation diagnostics, all-reduced after the loop:
+    # [hit_cap, stopped, early_stop_no_marker, has_marker, n, shots_sum]
+    diag = torch.zeros(6, dtype=torch.float32, device=device)
+
     if device.type == "npu":
         torch.npu.empty_cache()
     elif device.type == "cuda":
         torch.cuda.empty_cache()
+
+    def build_prompt(item, idx, budget):
+        # Deterministic per-idx few-shot selection (seed 1234+idx), popping
+        # the oldest exemplar until the prompt fits the budget. Operation
+        # order is identical to the pre-decoupling code, so equal budgets
+        # reproduce byte-identical prompts.
+        fewshot_examples = []
+        if num_fewshot > 0:
+            rng = random.Random(1234 + idx)
+            available_indices = [i for i in range(len(data)) if i != idx]
+            fewshot_indices = rng.sample(available_indices, min(num_fewshot, len(available_indices)))
+            fewshot_examples = [data[i] for i in fewshot_indices]
+            if budget is not None:
+                while fewshot_examples:
+                    prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
+                    prompt_tokens = tokenizer(prompt, prepend=bos_token_id)
+                    if len(prompt_tokens) <= budget:
+                        break
+                    fewshot_examples.pop(0)
+        prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
+        prompt_tokens = tokenizer(prompt, prepend=bos_token_id)
+        if budget and len(prompt_tokens) > budget:
+            prompt_tokens = prompt_tokens[:budget]
+        return prompt, prompt_tokens, len(fewshot_examples)
+
+    def account(p, raw_text, gen_len):
+        # Stop-string truncation + diagnostic accounting for one generation.
+        text = apply_stop_strings(raw_text, stop_strings)
+        stopped = len(text) < len(raw_text)
+        has_marker = marker is not None and marker in text
+        diag[0] += float(gen_len >= max_gen_tokens)
+        diag[1] += float(stopped)
+        diag[2] += float(stopped and not has_marker)
+        diag[3] += float(has_marker)
+        diag[4] += 1.0
+        diag[5] += float(p['shots'])
+        return text
 
     prepared = []
     for idx in my_indices:
@@ -493,26 +580,15 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
         if 'gold_answer' in item and item['gold_answer']:
             gold_answer = item['gold_answer']
 
-        fewshot_examples = []
-        if num_fewshot > 0:
-            rng = random.Random(1234 + idx)
-            available_indices = [i for i in range(len(data)) if i != idx]
-            fewshot_indices = rng.sample(available_indices, min(num_fewshot, len(available_indices)))
-            fewshot_examples = [data[i] for i in fewshot_indices]
-            if max_prompt_len is not None:
-                while fewshot_examples:
-                    prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
-                    prompt_tokens = tokenizer(prompt, prepend=bos_token_id)
-                    if len(prompt_tokens) <= max_prompt_len:
-                        break
-                    fewshot_examples.pop(0)
-
-        prompt = render_prompt_generation(item, continuation_delimiter, fewshot_examples)
-        prompt_tokens = tokenizer(prompt, prepend=bos_token_id)
-        if max_prompt_len and len(prompt_tokens) > max_prompt_len:
-            prompt_tokens = prompt_tokens[:max_prompt_len]
-
-        prepared.append((idx, prompt_tokens, gold_answer, prompt))
+        gen_prompt, gen_tokens, n_shots = build_prompt(item, idx, max_prompt_len)
+        if nll_prompt_budget == max_prompt_len:
+            nll_prompt, nll_tokens = gen_prompt, gen_tokens
+        else:
+            nll_prompt, nll_tokens, _ = build_prompt(item, idx, nll_prompt_budget)
+        prepared.append({
+            'idx': idx, 'tokens': gen_tokens, 'gold': gold_answer, 'prompt': gen_prompt,
+            'nll_prompt': nll_prompt, 'nll_tokens': nll_tokens, 'shots': n_shots,
+        })
 
     local_correct = 0.0
     local_done = 0
@@ -521,9 +597,9 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
     while batch_start < len(prepared):
         batch_end = min(batch_start + current_batch_size, len(prepared))
         batch = prepared[batch_start:batch_end]
-        batch_prompts = [p[1] for p in batch]
-        batch_indices = [p[0] for p in batch]
-        batch_golds = [p[2] for p in batch]
+        batch_prompts = [p['tokens'] for p in batch]
+        batch_indices = [p['idx'] for p in batch]
+        batch_golds = [p['gold'] for p in batch]
 
         try:
             results, _ = engine.generate_batch_prompts(
@@ -542,25 +618,30 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
             if is_oom and current_batch_size > 1:
                 current_batch_size = max(1, current_batch_size // 2)
                 continue
-            for idx, prompt_tokens, gold, _ in batch:
+            for p in batch:
                 local_done += 1
                 try:
                     generated, _ = engine.generate_batch(
-                        prompt_tokens, num_samples=1, max_tokens=max_gen_tokens, temperature=0
+                        p['tokens'], num_samples=1, max_tokens=max_gen_tokens, temperature=0
                     )
-                    generated_text = tokenizer.decode(generated[0][len(prompt_tokens):])
+                    raw_text = tokenizer.decode(generated[0][len(p['tokens']):])
+                    generated_text = account(p, raw_text, len(generated[0]) - len(p['tokens']))
                     pred_answer = extract_answer(generated_text, answer_extractor)
-                    is_correct = compare_answers(pred_answer, gold, answer_extractor)
-                    correct[idx] = float(is_correct)
+                    is_correct = compare_answers(pred_answer, p['gold'], answer_extractor)
+                    correct[p['idx']] = float(is_correct)
                     local_correct += float(is_correct)
                 except RuntimeError:
-                    correct[idx] = 0.0
-                    print0(f"  [{label}] Error at example {idx}, skipping")
+                    diag[4] += 1.0
+                    diag[5] += float(p['shots'])
+                    correct[p['idx']] = 0.0
+                    print0(f"  [{label}] Error at example {p['idx']}, skipping")
             batch_start += len(batch)
             continue
 
         for i, (idx, gold) in enumerate(zip(batch_indices, batch_golds)):
-            generated_text = tokenizer.decode(results[i][len(batch_prompts[i]):])
+            raw_text = tokenizer.decode(results[i][len(batch_prompts[i]):])
+            gen_len = len(results[i]) - len(batch_prompts[i])
+            generated_text = account(batch[i], raw_text, gen_len)
             pred_answer = extract_answer(generated_text, answer_extractor)
             is_correct = compare_answers(pred_answer, gold, answer_extractor)
             correct[idx] = float(is_correct)
@@ -581,13 +662,23 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
 
         batch_start = batch_end
 
+    # Generation diagnostics (all ranks contribute; print on master).
+    if world_size > 1:
+        dist.all_reduce(diag, op=dist.ReduceOp.SUM)
+    n_total = max(int(diag[4].item()), 1)
+    print0(f"  [{label}] GEN-DIAG: N={int(diag[4].item())} "
+           f"marker_rate={diag[3].item()/n_total:.4f} hit_cap={diag[0].item()/n_total:.4f} "
+           f"stopped={diag[1].item()/n_total:.4f} early_no_marker={diag[2].item()/n_total:.4f} "
+           f"avg_shots={diag[5].item()/n_total:.2f}")
+
     # Compute teacher-forced NLL on gold answers
     print0(f"  [{label}] Computing teacher-forced NLL on gold answers...")
-    for idx, prompt_tokens, _, prompt in prepared:
+    for p in prepared:
+        idx = p['idx']
         item = data[idx]
         answer_text = str(item['answer'])
-        full_tokens = tokenizer(prompt + answer_text, prepend=bos_token_id)
-        start_idx = len(prompt_tokens)
+        full_tokens = tokenizer(p['nll_prompt'] + answer_text, prepend=bos_token_id)
+        start_idx = len(p['nll_tokens'])
         end_idx = len(full_tokens)
         if end_idx <= start_idx:
             nlls[idx] = 0.0

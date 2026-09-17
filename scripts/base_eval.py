@@ -118,6 +118,13 @@ STEM_TASKS = [
         'icl_task_type': 'multiple_choice',
         'continuation_delimiter': '\nAnswer: ',
     },
+    # Generation-task protocol (2026-09-17): stop strings = the few-shot
+    # delimiter re-appearing (hallucinated next round; gold-verified 0 false
+    # positives, see core_eval.apply_stop_strings). math_cot_500 cap 256->1024:
+    # 30.2% of gold answers exceed 256 tokens (p95=643, p99=893) — a structural
+    # truncation floor on the accuracy column. gsm8k stays 256 (0.8% tail).
+    # The NLL prompt budget stays frozen at the historical max_seq_len-256 in
+    # core_eval (_NLL_FROZEN_GEN_CAP) regardless of the generation cap.
     {
         'label': 'gsm8k_cot',
         'dataset_uri': 'gsm8k.jsonl',
@@ -126,6 +133,7 @@ STEM_TASKS = [
         'continuation_delimiter': '\nAnswer: ',
         'answer_extractor': 'gsm8k',
         'max_gen_tokens': 256,
+        'stop_strings': ['\nAnswer: '],
     },
     {
         'label': 'math_cot_500',
@@ -134,7 +142,8 @@ STEM_TASKS = [
         'icl_task_type': 'generation',
         'continuation_delimiter': '\n\nSolution: ',
         'answer_extractor': 'math',
-        'max_gen_tokens': 256,
+        'max_gen_tokens': 1024,
+        'stop_strings': ['\n\nSolution: '],
     },
     {
         'label': 'mmlu_zeroshot',
@@ -259,17 +268,21 @@ def prepare_eval_data(benchmarks='all'):
     print0('  All eval data ready')
 
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_size=1, benchmarks=None):
+def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_size=1, benchmarks=None,
+                  gen_max_tokens_override=None, no_stop_strings=False):
     """
     Evaluate a base model on selected benchmarks.
     Returns dict with results, centered_results, core_metric.
     core_metric is averaged only over the DCLM core tasks.
-    
+
     benchmarks controls which tasks to evaluate:
       None or 'all'  : evaluate all (core + stem)
       'core'         : evaluate only DCLM core tasks
       'stem'         : evaluate only STEM benchmarks (GPQA, GSM8K, MATH_COT_500, MMLU)
       comma-separated: evaluate specific benchmarks by label (e.g. 'mmlu_fewshot,gsm8k_cot')
+
+    gen_max_tokens_override / no_stop_strings: generation-task protocol A/B knobs
+    (--max-gen-tokens / --no-stop-strings); production callers never pass them.
     """
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
@@ -344,8 +357,16 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
                 'continuation_delimiter': task.get('continuation_delimiter', ' '),
                 'answer_extractor': task.get('answer_extractor', 'gsm8k'),
                 'max_gen_tokens': task.get('max_gen_tokens', 512),
+                'stop_strings': task.get('stop_strings', []),
+                'nll_prompt_budget': task.get('nll_prompt_budget'),
                 'label': label,
             }
+            # A/B overrides (protocol experiments only; production paths never
+            # pass these flags and use the per-task registry values verbatim).
+            if gen_max_tokens_override is not None and task_meta['task_type'] == 'generation':
+                task_meta['max_gen_tokens'] = gen_max_tokens_override
+            if no_stop_strings:
+                task_meta['stop_strings'] = []
             print0(f"Evaluating: {label} ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
 
             data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
@@ -416,6 +437,8 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--core-eval-batch-size', type=int, default=16, help='Number of examples to batch per forward pass in CORE eval (1 = original behavior)')
     parser.add_argument('--eval-benchmarks', type=str, default=None, help='Benchmarks to evaluate: all, core, stem, or comma-separated labels (e.g. mmlu_fewshot,gsm8k_cot). Default: all')
+    parser.add_argument('--max-gen-tokens', type=int, default=None, help='Override max_gen_tokens for generation tasks (protocol A/B only; production uses the per-task registry value)')
+    parser.add_argument('--no-stop-strings', action='store_true', help='Disable stop-string truncation for generation tasks (A/B control)')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
     args = parser.parse_args()
@@ -529,7 +552,7 @@ def main():
         print0("\n" + "="*80)
         print0("CORE Evaluation")
         print0("="*80)
-        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, core_eval_batch_size=args.core_eval_batch_size, benchmarks=benchmarks)
+        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, core_eval_batch_size=args.core_eval_batch_size, benchmarks=benchmarks, gen_max_tokens_override=args.max_gen_tokens, no_stop_strings=args.no_stop_strings)
 
         # Write CSV output
         if ddp_rank == 0:
