@@ -16,6 +16,17 @@ These tests pin:
   - the STEM_TASKS registry values (caps + stop strings == delimiters)
   - the NLL prompt budget stays frozen at the historical cap
 
+A/B evidence (2026-09-17, d28_random_prod3, 8x910B4, full sets, local):
+- old-protocol reproduction (gsm8k, stops off): acc 0.1190 / nll 0.6420 —
+  byte-exact vs the recorded prod3 32-card eval (0.119030 / 0.642035)
+- gsm8k stops on vs off: acc 0.1198 vs 0.1190 (noise), nll identical;
+  stopped=0.799, early_no_marker=0.0015 (false-positive rate ~0)
+- math cap 512 vs 1024 (stops on): marker_rate 0.188 -> 0.258, acc 0.016 ->
+  0.022, avg_shots 3.98 -> 2.72, hit_cap 0.978 -> 0.944; nll 0.8460 in BOTH
+  (= historical 0.845960) — the decoupling canary. cap 1024 locked: the model
+  is far more verbose than gold lengths suggest (97.8% of generations hit the
+  512 cap), and fewer shots did NOT hurt format following (marker rose).
+
 Run: python tests/test_gen_eval_stops.py
 """
 import os
