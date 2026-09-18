@@ -478,7 +478,10 @@ def main():
         model_name = args.hf_path
         model_slug = args.hf_path.replace("/", "-")
     else:
-        model, tokenizer, meta = load_model(args.model_type, device, phase="eval", model_tag=args.model_tag, step=args.step)
+        # precast_weights: one-shot bf16 cast for eval (value-identical forwards,
+        # removes the per-decode-step weight cast traffic + ~5GB copy pool).
+        # Escape hatch: NANOCHAT_EVAL_WEIGHTCAST=0.
+        model, tokenizer, meta = load_model(args.model_type, device, phase="eval", model_tag=args.model_tag, step=args.step, precast_weights=True)
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
         model_name = f"{args.model_type}_model (step {meta['step']})"

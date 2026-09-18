@@ -9,8 +9,9 @@ import shutil
 import logging
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_base_dir, COMPUTE_DTYPE
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
@@ -114,13 +115,101 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     return model_data, optimizer_data, meta_data
 
 
-def build_model(checkpoint_dir, step, device, phase):
+def precast_eval_weights(model, dtype=None, selfcheck=None):
+    """One-shot cast of Linear/Embedding weights to the compute dtype for eval.
+
+    Training keeps fp32 master weights; Linear.forward casts them to the input
+    dtype on every call (gpt.py Linear docstring: "Replaces autocast"). That is
+    amortized in training (thousands of tokens per forward) but pathological in
+    eval decode (tiny batch, 1 token per step): every decode step re-reads all
+    fp32 weights and writes a full bf16 copy that the caching allocator then
+    keeps resident (~5GB/card on the d28 mid models, on top of the cast
+    traffic dominating step time). Casting once at load time is value-identical:
+    Linear.forward's per-op cast becomes a no-op, so every matmul sees exactly
+    the same (activation, cast weight) inputs as before; GPT.forward casts
+    embedding lookups to the compute dtype immediately after lookup, so storing
+    pre-cast values is identical too.
+
+    Scope (deliberately narrow):
+    - nn.Linear.weight (all are the custom cast-in-forward Linear)
+    - nn.Embedding.weight (wte + value_embeds; already bf16 in checkpoints,
+      re-cast is a no-op but keeps the function dtype-uniform)
+    Per-layer scalar params (resid/x0/smear/backout lambdas) keep their
+    checkpoint dtype: they act via 0-dim type promotion or an explicit
+    .to(x.dtype), both dtype-agnostic.
+
+    MUST only be used for inference paths. Training on pre-cast weights loses
+    fp32 master precision (chat_rl loads with phase="eval" but trains — that
+    is why this is an explicit opt-in on build_model, not an eval-phase
+    default).
+
+    A built-in self-check (on by default) runs one reference forward before
+    the cast and one after and requires bit-identical logits, so any missed
+    call site or dtype surprise fails loudly at load time instead of silently
+    shifting eval numbers. Gate A (old-protocol byte-exact reproduction)
+    remains the end-to-end backstop.
+
+    Env switches:
+    - NANOCHAT_EVAL_WEIGHTCAST=0 disables entirely (exact legacy behavior)
+    - NANOCHAT_EVAL_WEIGHTCAST_SELFCHECK=0 skips the self-check
+
+    Returns (n_cast, n_already) weight-tensor counts.
+    """
+    if os.environ.get("NANOCHAT_EVAL_WEIGHTCAST", "1") == "0":
+        log0("Eval weight pre-cast: disabled via NANOCHAT_EVAL_WEIGHTCAST=0")
+        return 0, 0
+    if dtype is None:
+        dtype = COMPUTE_DTYPE
+    if selfcheck is None:
+        selfcheck = os.environ.get("NANOCHAT_EVAL_WEIGHTCAST_SELFCHECK", "1") != "0"
+
+    modules = [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Embedding))]
+    to_cast = [m for m in modules if m.weight.dtype != dtype]
+    if not to_cast:
+        log0(f"Eval weight pre-cast: nothing to do ({len(modules)} weights already {dtype})")
+        return 0, len(modules)
+
+    device = model.get_device()
+    # Deterministic self-check input (fixed seed, no RNG device dependence).
+    gen = torch.Generator().manual_seed(1234)
+    ids = torch.randint(0, model.config.vocab_size, (1, 32), generator=gen).to(device)
+
+    if selfcheck:
+        with torch.no_grad():
+            ref_logits = model(ids)  # legacy path: per-op casts on fp32 weights
+
+    before_bytes = sum(m.weight.numel() * m.weight.element_size() for m in to_cast)
+    for m in to_cast:
+        m.weight.data = m.weight.data.to(dtype)
+    after_bytes = sum(m.weight.numel() * m.weight.element_size() for m in to_cast)
+
+    if selfcheck:
+        with torch.no_grad():
+            new_logits = model(ids)
+        if not torch.equal(ref_logits, new_logits):
+            raise RuntimeError(
+                "Eval weight pre-cast self-check FAILED: logits differ after the "
+                "one-shot dtype cast (expected bit-identical). Set "
+                "NANOCHAT_EVAL_WEIGHTCAST=0 to fall back to legacy per-op casting."
+            )
+        log0(f"Eval weight pre-cast self-check: logits bit-identical over {ids.size(1)} tokens")
+
+    log0(f"Eval weight pre-cast: {len(to_cast)}/{len(modules)} weight tensors -> {dtype} "
+         f"({before_bytes / 1e9:.2f}GB -> {after_bytes / 1e9:.2f}GB resident weights)")
+    return len(to_cast), len(modules) - len(to_cast)
+
+
+def build_model(checkpoint_dir, step, device, phase, precast_weights=False):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
     - base model - uncompiled, not wrapped in DDP
     - tokenizer
     - meta data saved during base model training
+
+    precast_weights=True (eval-only) one-shot casts Linear/Embedding weights
+    to COMPUTE_DTYPE after loading — see precast_eval_weights. Opt-in because
+    some callers load with phase="eval" and then train (chat_rl).
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
@@ -146,7 +235,11 @@ def build_model(checkpoint_dir, step, device, phase):
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
+        if precast_weights:
+            precast_eval_weights(model)
     else:
+        assert not precast_weights, \
+            "precast_weights=True requires phase='eval' (training must keep fp32 master weights)"
         model.train()
     # Load the Tokenizer
     tokenizer = get_tokenizer()
@@ -186,7 +279,7 @@ def find_last_step(checkpoint_dir):
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
-def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
+def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None, precast_weights=False):
     if model_tag is None:
         # guess the model tag by defaulting to the largest model
         model_tag = find_largest_model(checkpoints_dir)
@@ -198,7 +291,7 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     assert step is not None, f"No checkpoints found in {checkpoint_dir}"
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
-    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase, precast_weights=precast_weights)
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):
