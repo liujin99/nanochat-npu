@@ -269,7 +269,7 @@ def prepare_eval_data(benchmarks='all'):
 
 
 def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_size=1, benchmarks=None,
-                  gen_max_tokens_override=None, no_stop_strings=False):
+                  gen_max_tokens_override=None, no_stop_strings=False, gen_batch_size=8):
     """
     Evaluate a base model on selected benchmarks.
     Returns dict with results, centered_results, core_metric.
@@ -380,7 +380,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_siz
                 data = data[:max_per_task]
 
             if task_meta['task_type'] == 'generation':
-                accuracy, nll = evaluate_generation_task(model, tokenizer, data, device, task_meta)
+                accuracy, nll = evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batch_size=gen_batch_size)
             else:
                 accuracy, nll = evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=core_eval_batch_size)
             if device.type == "npu":
@@ -436,6 +436,7 @@ def main():
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--core-eval-batch-size', type=int, default=16, help='Number of examples to batch per forward pass in CORE eval (1 = original behavior)')
+    parser.add_argument('--gen-batch-size', type=int, default=8, help='Batch size for generation tasks (gsm8k/math). Default 8 = historical protocol. Larger values change batched-GEMM numerics slightly; validate score-neutrality (Gate C) before adopting a new default.')
     parser.add_argument('--eval-benchmarks', type=str, default=None, help='Benchmarks to evaluate: all, core, stem, or comma-separated labels (e.g. mmlu_fewshot,gsm8k_cot). Default: all')
     parser.add_argument('--max-gen-tokens', type=int, default=None, help='Override max_gen_tokens for generation tasks (protocol A/B only; production uses the per-task registry value)')
     parser.add_argument('--no-stop-strings', action='store_true', help='Disable stop-string truncation for generation tasks (A/B control)')
@@ -555,7 +556,7 @@ def main():
         print0("\n" + "="*80)
         print0("CORE Evaluation")
         print0("="*80)
-        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, core_eval_batch_size=args.core_eval_batch_size, benchmarks=benchmarks, gen_max_tokens_override=args.max_gen_tokens, no_stop_strings=args.no_stop_strings)
+        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, core_eval_batch_size=args.core_eval_batch_size, benchmarks=benchmarks, gen_max_tokens_override=args.max_gen_tokens, no_stop_strings=args.no_stop_strings, gen_batch_size=args.gen_batch_size)
 
         # Write CSV output
         if ddp_rank == 0:
