@@ -423,7 +423,7 @@ class Engine:
 
     @torch.inference_mode()
     def generate_batch_prompts(self, prompts, max_tokens=None, temperature=1.0, top_k=None, seed=42,
-                               pipelined=None, pipe_k=None):
+                               pipelined=None, pipe_k=None, stop_strings=None):
         """
         Batch generation for multiple different prompts.
         Prefills each prompt serially, merges KV caches, then decodes in parallel.
@@ -441,6 +441,18 @@ class Engine:
         pipe_k or NANOCHAT_GEN_PIPE_K (default 8). The pipelined path does
         not implement the calculator tool-use forcing (a chat-side feature;
         chat callers sample at temperature>0 and take the legacy loop).
+
+        stop_strings: pipelined-only early completion — once a stop string
+        occurs in a row's decoded generated span (checked once per window,
+        so up to pipe_k tokens late), the row freezes. Scores are provably
+        unchanged: the scoring side re-decodes and truncates at the FIRST
+        occurrence (apply_stop_strings), and BPE decode is byte-prefix
+        monotone, so extra tokens generated past the occurrence are exactly
+        the ones that get discarded. The legacy loop ignores stop_strings
+        (generates to cap; scoring still truncates post-hoc — same scores,
+        more compute). Stop strings are ASCII in the eval registries, so
+        U+FFFD tail artifacts from a utf-8 split at the harvest boundary
+        cannot trigger false positives.
         """
         assert isinstance(prompts, list) and all(isinstance(p, list) for p in prompts)
         if pipelined is None:
@@ -454,6 +466,7 @@ class Engine:
             except ValueError:
                 pipe_k = 8
         pipe_k = max(1, pipe_k)
+        stop_checks = list(stop_strings) if stop_strings else []
         B = len(prompts)
         if B == 0:
             return [], []
@@ -521,6 +534,19 @@ class Engine:
                     logits = self.model.forward(next_ids, kv_cache=batch_cache)[:, -1, :]
                     num_generated += 1
                 win_cpu = win_ids.cpu().tolist()  # the single device->CPU sync per window
+                if stop_checks:
+                    # Stop-string early completion (pipelined-only): freeze rows
+                    # whose decoded generated span already contains a stop
+                    # string. Checked once per row per window (before appending
+                    # this window's tokens), so detection is up to one window
+                    # late — harmless, the scoring side discards everything
+                    # after the first occurrence anyway.
+                    for i in range(B):
+                        if not completed[i]:
+                            text = self.tokenizer.decode(results[i][len(prompts[i]):])
+                            if any(s in text for s in stop_checks):
+                                completed[i] = True
+                                row_states[i].completed = True
                 for t in range(window):
                     col = win_cpu[t]
                     all_done = True

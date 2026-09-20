@@ -538,8 +538,8 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
     oom_flag = torch.tensor([0.0], device=device)
 
     # Generation diagnostics, all-reduced after the loop:
-    # [hit_cap, stopped, early_stop_no_marker, has_marker, n, shots_sum]
-    diag = torch.zeros(6, dtype=torch.float32, device=device)
+    # [hit_cap, stopped, early_stop_no_marker, has_marker, n, shots_sum, gen_len_sum]
+    diag = torch.zeros(7, dtype=torch.float32, device=device)
 
     if device.type == "npu":
         torch.npu.empty_cache()
@@ -581,6 +581,7 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
         diag[3] += float(has_marker)
         diag[4] += 1.0
         diag[5] += float(p['shots'])
+        diag[6] += float(gen_len)
         return text
 
     prepared = []
@@ -613,7 +614,8 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
 
         try:
             results, _ = engine.generate_batch_prompts(
-                batch_prompts, max_tokens=max_gen_tokens, temperature=0
+                batch_prompts, max_tokens=max_gen_tokens, temperature=0,
+                stop_strings=stop_strings,
             )
         except RuntimeError as e:
             err_str = str(e).lower()
@@ -676,10 +678,17 @@ def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batc
     if world_size > 1:
         dist.all_reduce(diag, op=dist.ReduceOp.SUM)
     n_total = max(int(diag[4].item()), 1)
+    # With engine early-stop active, hit_cap/avg_gen_len reflect engine-stopped
+    # lengths (a row that hit its stop string no longer "hits the cap") —
+    # scores are unaffected; append the note so longitudinal diag comparisons
+    # don't misread the semantic shift.
+    diag_note = (" (note: engine early-stop active, hit_cap/avg_gen_len are "
+                 "engine-stopped lengths)" if stop_strings else "")
     print0(f"  [{label}] GEN-DIAG: N={int(diag[4].item())} "
            f"marker_rate={diag[3].item()/n_total:.4f} hit_cap={diag[0].item()/n_total:.4f} "
            f"stopped={diag[1].item()/n_total:.4f} early_no_marker={diag[2].item()/n_total:.4f} "
-           f"avg_shots={diag[5].item()/n_total:.2f}")
+           f"avg_shots={diag[5].item()/n_total:.2f} avg_gen_len={diag[6].item()/n_total:.1f}"
+           f"{diag_note}")
 
     # Compute teacher-forced NLL on gold answers
     print0(f"  [{label}] Computing teacher-forced NLL on gold answers...")
