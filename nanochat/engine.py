@@ -422,13 +422,38 @@ class Engine:
         return results, masks
 
     @torch.inference_mode()
-    def generate_batch_prompts(self, prompts, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate_batch_prompts(self, prompts, max_tokens=None, temperature=1.0, top_k=None, seed=42,
+                               pipelined=None, pipe_k=None):
         """
         Batch generation for multiple different prompts.
         Prefills each prompt serially, merges KV caches, then decodes in parallel.
         Returns (results, masks) where results[i] is the full token sequence for prompt i.
+
+        pipelined: greedy decode (temperature==0) can run pipe_k steps without
+        device->CPU syncs — sampled ids stay on device and feed the next
+        forward directly; tokens are harvested with ONE .cpu() per window.
+        This removes the per-step tolist()/torch.tensor() ping-pong that
+        serializes CPU and NPU on every decode step. Token streams are
+        bit-identical to the legacy loop (same argmax over the same logits,
+        same tokens fed in the same order; forced_tokens is always empty at
+        temperature==0 in eval callers). Default: auto-on for
+        temperature==0; NANOCHAT_GEN_PIPELINED=0 disables; window size via
+        pipe_k or NANOCHAT_GEN_PIPE_K (default 8). The pipelined path does
+        not implement the calculator tool-use forcing (a chat-side feature;
+        chat callers sample at temperature>0 and take the legacy loop).
         """
         assert isinstance(prompts, list) and all(isinstance(p, list) for p in prompts)
+        if pipelined is None:
+            pipelined = (temperature == 0.0
+                         and os.environ.get("NANOCHAT_GEN_PIPELINED", "1") != "0")
+        assert not (pipelined and temperature != 0.0), \
+            "the pipelined decode path is greedy-only (temperature==0)"
+        if pipe_k is None:
+            try:
+                pipe_k = int(os.environ.get("NANOCHAT_GEN_PIPE_K", "8"))
+            except ValueError:
+                pipe_k = 8
+        pipe_k = max(1, pipe_k)
         B = len(prompts)
         if B == 0:
             return [], []
@@ -476,6 +501,45 @@ class Engine:
         masks = [[0] * len(p) for p in prompts]
         completed = [False] * B
         num_generated = 0
+
+        if pipelined:
+            # Greedy fast path: run up to pipe_k forwards with the sampled ids
+            # living entirely on device, then harvest once per window and
+            # replay the row-state machine in order (identical semantics to
+            # the legacy loop below; forced_tokens is always empty here).
+            while True:
+                if max_tokens is not None and num_generated >= max_tokens:
+                    break
+                if all(completed):
+                    break
+                window = pipe_k if max_tokens is None else min(pipe_k, max_tokens - num_generated)
+                window = max(1, window)
+                win_ids = torch.empty(window, B, dtype=torch.long, device=device)
+                for t in range(window):
+                    next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1) greedy
+                    win_ids[t] = next_ids[:, 0]
+                    logits = self.model.forward(next_ids, kv_cache=batch_cache)[:, -1, :]
+                    num_generated += 1
+                win_cpu = win_ids.cpu().tolist()  # the single device->CPU sync per window
+                for t in range(window):
+                    col = win_cpu[t]
+                    all_done = True
+                    for i, state in enumerate(row_states):
+                        next_token = col[i]
+                        state.current_tokens.append(next_token)
+                        if next_token == assistant_end or next_token == bos:
+                            state.completed = True
+                        if not completed[i]:
+                            if next_token == assistant_end or next_token == bos:
+                                completed[i] = True
+                            else:
+                                results[i].append(next_token)
+                                masks[i].append(1)
+                        if not completed[i]:
+                            all_done = False
+                    if all_done:
+                        break
+            return results, masks
 
         while True:
             if max_tokens is not None and num_generated >= max_tokens:
