@@ -109,13 +109,30 @@ class CausalSelfAttention(nn.Module):
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
+            if T == 1 and kv_cache.decode_fast():
+                # Sync-free ragged-decode fast path: advanced-index cache write
+                # (one kernel per layer instead of B .item()-gated writes),
+                # CPU-known end position, and per-step masks reused across all
+                # layers. Bit-identical results; opt out with NANOCHAT_KV_FAST=0.
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                    per_row=True,
+                    cache_len_hint=kv_cache.decode_end_pos(),
+                    attn_mask_override=kv_cache.step_attn_mask(window_size[0], q.dtype),
+                    fast=True,
+                )
+            else:
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)

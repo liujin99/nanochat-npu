@@ -13,6 +13,7 @@ The whole thing is made as efficient as possible.
 
 import torch
 import torch.nn.functional as F
+import os
 import signal
 import warnings
 from contextlib import contextmanager
@@ -102,10 +103,24 @@ class KVCache:
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         # Previous token embedding for smear (set during forward pass)
         self.prev_embedding = None
+        # CPU-side mirrors for the sync-free ragged-decode fast path
+        # (NANOCHAT_KV_FAST): every decode step used to cost ~28 device
+        # syncs (per-row .item() writes + .max().item() + per_row checks
+        # across 28 layers). The engine tracks these on the CPU instead:
+        # - _ragged: rows sit at differing positions (set by merge_from_list)
+        # - _max_pos_cpu: max row position (int)
+        # - _step_masks: per-step attention masks keyed by (window_left,
+        #   dtype), rebuilt whenever positions change (advance/prefill/merge)
+        self._ragged = False
+        self._max_pos_cpu = 0
+        self._step_masks = {}
 
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
+        self._ragged = False
+        self._max_pos_cpu = 0
+        self._step_masks = {}
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -116,8 +131,10 @@ class KVCache:
         return self.k_cache[layer_idx], self.v_cache[layer_idx]
 
     def advance(self, num_tokens):
-        """Advance the cache position by num_tokens."""
+        """Advance the cache position by num_tokens (uniform across rows)."""
         self.cache_seqlens += num_tokens
+        self._max_pos_cpu += num_tokens
+        self._step_masks = {}  # positions changed -> cached masks are stale
 
     def prefill(self, other):
         """
@@ -131,6 +148,9 @@ class KVCache:
         self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
         self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
         self.cache_seqlens.fill_(other_pos)
+        self._ragged = False
+        self._max_pos_cpu = other_pos
+        self._step_masks = {}
 
     def merge_from_list(self, cache_list):
         """
@@ -151,11 +171,60 @@ class KVCache:
         prev_embeddings = [c.prev_embedding for c in cache_list]
         if all(pe is not None for pe in prev_embeddings):
             self.prev_embedding = torch.cat(prev_embeddings, dim=0)
+        # maintain the CPU mirrors (positions are all on-CPU here already)
+        positions = [c.get_pos() for c in cache_list]
+        self._ragged = len(set(positions)) > 1
+        self._max_pos_cpu = max(positions)
+        self._step_masks = {}
 
     def has_per_row_positions(self):
+        # Fast path: the mirror is authoritative for every mutation that goes
+        # through KVCache methods (reset/prefill/merge/advance) — no device
+        # sync. Direct cache_seqlens tensor writes (tests, exotic callers)
+        # still get the live check, preserving the historical contract at the
+        # cost of one sync on the uniform path (prefill / batch=1 decode).
+        if self._ragged:
+            return True
         if self.cache_seqlens.numel() <= 1:
             return False
         return not (self.cache_seqlens == self.cache_seqlens[0]).all().item()
+
+    def decode_fast(self):
+        """True when the sync-free ragged-decode fast path applies.
+
+        Opt out with NANOCHAT_KV_FAST=0 (falls back to the legacy shim path,
+        which costs ~28 device syncs + per-layer mask construction per decode
+        step; results are bit-identical either way).
+        """
+        return (self._ragged and self.batch_size > 1
+                and os.environ.get("NANOCHAT_KV_FAST", "1") != "0")
+
+    def decode_end_pos(self):
+        """Cache columns valid for a T=1 decode step (CPU-known, no sync)."""
+        return self._max_pos_cpu + 1
+
+    def step_attn_mask(self, window_left, dtype):
+        """Additive attention mask (B, 1, 1, Tk) for the current decode step.
+
+        Same semantics as the per-row mask built inline in the legacy
+        flash_attn_with_kvcache path (col <= pos_i, plus col >= pos_i -
+        window_left when windowed), but built once per step per window
+        variant and reused across all layers (28x fewer mask kernels).
+        Cached until the next position change (advance/prefill/merge).
+        """
+        key = (window_left, dtype)
+        m = self._step_masks.get(key)
+        if m is None:
+            Tk = self._max_pos_cpu + 1  # keys span [0, max_pos] inclusive
+            col = torch.arange(Tk, device=self.cache_seqlens.device)
+            row = self.cache_seqlens.unsqueeze(1).long()  # (B, 1)
+            keep = col.unsqueeze(0) <= row
+            if window_left >= 0:
+                keep = keep & (col.unsqueeze(0) >= (row - window_left))
+            m = torch.where(keep, 0.0, -1e9).to(dtype=dtype)
+            m = m.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Tk)
+            self._step_masks[key] = m
+        return m
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()

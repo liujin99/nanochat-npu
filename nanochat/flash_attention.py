@@ -171,36 +171,75 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
-                            causal=False, window_size=(-1, -1)):
+                            causal=False, window_size=(-1, -1), *,
+                            per_row=None, cache_len_hint=None,
+                            attn_mask_override=None, fast=False):
+    """NPU-adapted flash_attn_with_kvcache.
+
+    Optional kwargs for the sync-free decode fast path (gpt.py passes them;
+    all default to the legacy behavior for API compatibility):
+    - per_row: precomputed ragged-cache flag (avoids a .all().item() sync)
+    - cache_len_hint: int end position (avoids a .max().item() sync per layer)
+    - attn_mask_override: (B,1,1,Tk) additive mask reused across layers
+    - fast: T==1 decode path — advanced-index cache write (one kernel per
+      layer instead of B .item()-gated writes) + zero-copy strided views
+      into the cache instead of four .contiguous() copies per layer
+      (~7.5GB of pure copy traffic per decode step at B=8, 28 layers).
+    """
     B, T_new, H, D = q.shape
-    per_row = (cache_seqlens is not None and cache_seqlens.numel() > 1
-               and not (cache_seqlens == cache_seqlens[0]).all().item())
+    if per_row is None:
+        per_row = (cache_seqlens is not None and cache_seqlens.numel() > 1
+                   and not (cache_seqlens == cache_seqlens[0]).all().item())
 
     if per_row:
-        seqlens = cache_seqlens.to(torch.int64).to(q.device)
-        if k is not None and v is not None:
-            for i in range(B):
-                pos_i = seqlens[i].item()
-                k_cache[i, pos_i:pos_i+T_new, :, :] = k[i]
-                v_cache[i, pos_i:pos_i+T_new, :, :] = v[i]
-        max_seqlen = seqlens.max().item()
-        end_pos = max_seqlen + T_new
-        k_full = k_cache[:, :end_pos, :, :].contiguous()
-        v_full = v_cache[:, :end_pos, :, :].contiguous()
-        Tk = end_pos
-        col_idx = torch.arange(Tk, device=q.device, dtype=torch.int64)
-        row_seqlens = seqlens.unsqueeze(1)
-        col_broadcast = col_idx.unsqueeze(0)
-        mask_bool = col_broadcast <= row_seqlens
-        window_left = window_size[0]
-        if window_left >= 0:
-            keep_start = torch.clamp(row_seqlens - window_left, min=0)
-            mask_bool = mask_bool & (col_broadcast >= keep_start)
-        mask_4d = mask_bool.unsqueeze(1).unsqueeze(2)
-        attn_mask = torch.where(mask_4d, 0.0, -1e9).to(dtype=q.dtype)
-        q_sdpa = q.transpose(1, 2).contiguous()
-        k_sdpa = k_full.transpose(1, 2).contiguous()
-        v_sdpa = v_full.transpose(1, 2).contiguous()
+        if fast and T_new == 1 and k is not None and v is not None:
+            # Sync-free write: one advanced-index put per layer. cache_seqlens
+            # is a device tensor, so no device->CPU roundtrip is needed.
+            rows = torch.arange(B, device=k_cache.device)
+            cols = cache_seqlens.long()
+            k_cache[rows, cols] = k[:, 0]
+            v_cache[rows, cols] = v[:, 0]
+            positions = None
+        else:
+            seqlens = cache_seqlens.to(torch.int64).to(q.device)
+            positions = [seqlens[i].item() for i in range(B)]
+            if k is not None and v is not None:
+                for i in range(B):
+                    pos_i = positions[i]
+                    k_cache[i, pos_i:pos_i+T_new, :, :] = k[i]
+                    v_cache[i, pos_i:pos_i+T_new, :, :] = v[i]
+        if cache_len_hint is not None:
+            end_pos = cache_len_hint
+        else:
+            end_pos = (max(positions) if positions is not None
+                       else int(cache_seqlens.max().item())) + T_new
+        k_full = k_cache[:, :end_pos, :, :]
+        v_full = v_cache[:, :end_pos, :, :]
+        if attn_mask_override is not None:
+            attn_mask = attn_mask_override
+        else:
+            col_idx = torch.arange(end_pos, device=q.device, dtype=torch.int64)
+            row_seqlens = cache_seqlens.unsqueeze(1).long()
+            col_broadcast = col_idx.unsqueeze(0)
+            mask_bool = col_broadcast <= row_seqlens
+            window_left = window_size[0]
+            if window_left >= 0:
+                keep_start = torch.clamp(row_seqlens - window_left, min=0)
+                mask_bool = mask_bool & (col_broadcast >= keep_start)
+            mask_4d = mask_bool.unsqueeze(1).unsqueeze(2)
+            attn_mask = torch.where(mask_4d, 0.0, -1e9).to(dtype=q.dtype)
+        if fast:
+            # Zero-copy strided views: (B,Tk,H,D) -> (B,H,Tk,D). Same values,
+            # same SDPA math; no materialized copies.
+            q_sdpa = q.transpose(1, 2)
+            k_sdpa = k_full.transpose(1, 2)
+            v_sdpa = v_full.transpose(1, 2)
+        else:
+            k_full = k_full.contiguous()
+            v_full = v_full.contiguous()
+            q_sdpa = q.transpose(1, 2).contiguous()
+            k_sdpa = k_full.transpose(1, 2).contiguous()
+            v_sdpa = v_full.transpose(1, 2).contiguous()
         if _use_ascend_fa():
             y_sdpa = _ascend_fa_attention(q_sdpa, k_sdpa, v_sdpa, causal, window_size,
                                           is_training=False, attn_mask_override=attn_mask)
