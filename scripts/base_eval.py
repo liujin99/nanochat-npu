@@ -269,7 +269,7 @@ def prepare_eval_data(benchmarks='all'):
 
 
 def evaluate_core(model, tokenizer, device, max_per_task=-1, core_eval_batch_size=1, benchmarks=None,
-                  gen_max_tokens_override=None, no_stop_strings=False, gen_batch_size=8):
+                  gen_max_tokens_override=None, no_stop_strings=False, gen_batch_size=16):
     """
     Evaluate a base model on selected benchmarks.
     Returns dict with results, centered_results, core_metric.
@@ -436,7 +436,7 @@ def main():
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--core-eval-batch-size', type=int, default=16, help='Number of examples to batch per forward pass in CORE eval (1 = original behavior)')
-    parser.add_argument('--gen-batch-size', type=int, default=8, help='Batch size for generation tasks (gsm8k/math). Default 8 = historical protocol. Larger values change batched-GEMM numerics slightly; validate score-neutrality (Gate C) before adopting a new default.')
+    parser.add_argument('--gen-batch-size', type=int, default=16, help='Batch size for generation tasks (gsm8k/math). Default 16 (single default, CLI and signatures — main-agent ruling 2026-09-20): score-neutral vs the b8 era (identical correct-counts gsm8k 158/1319, math 11/500; ~5/1319 rows flip via near-tie argmax, NOT bit-reproducible against b8-era CSVs; NLL columns unaffected). 8 = historical protocol (prod1-4 + R1 re-eval).')
     parser.add_argument('--eval-benchmarks', type=str, default=None, help='Benchmarks to evaluate: all, core, stem, or comma-separated labels (e.g. mmlu_fewshot,gsm8k_cot). Default: all')
     parser.add_argument('--max-gen-tokens', type=int, default=None, help='Override max_gen_tokens for generation tasks (protocol A/B only; production uses the per-task registry value)')
     parser.add_argument('--no-stop-strings', action='store_true', help='Disable stop-string truncation for generation tasks (A/B control)')

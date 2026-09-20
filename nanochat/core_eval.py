@@ -500,7 +500,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta, eval_batch_size=1):
 
 
 @torch.no_grad()
-def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batch_size=8):
+def evaluate_generation_task(model, tokenizer, data, device, task_meta, gen_batch_size=16):
     """Evaluate generation task: accuracy via autoregressive generation + teacher-forced NLL.
     Returns (mean_correct, mean_nll).
     """
