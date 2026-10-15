@@ -1,6 +1,7 @@
 # NanoChat-NPU
 
 > 基于 [karpathy/nanochat](https://github.com/karpathy/nanochat) 的昇腾 NPU 适配版本
+> 训练后端：[climbmix](https://github.com/liujin99/climbmix)（Nemotron-CLIMB 非官方复现，数据配比搜索）
 
 ## NPU 适配说明
 
